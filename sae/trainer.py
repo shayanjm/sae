@@ -162,23 +162,30 @@ class SaeTrainer:
         device = self.model.device
 
         if dist.is_initialized():
-            sampler = DistributedSampler(
-                ds,
-                num_replicas=dist.get_world_size(),
-                rank=dist.get_rank(),
-                shuffle=False,
-                )
-        else:
-            sampler = None
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            total_samples = len(ds)
+            samples_per_rank = total_samples // world_size
 
+            start_index = rank * samples_per_rank
+            # Ensure the last rank takes any leftover samples
+            end_index = start_index + samples_per_rank if rank != world_size - 1 else total_samples
+
+            indices = list(range(start_index, end_index))
+            subset_ds = torch.utils.data.Subset(ds, indices)
+        else:
+            subset_ds = ds
+        
         dl = DataLoader(
-            ds, # type: ignore
+            subset_ds, # type: ignore
             batch_size=self.cfg.batch_size,
             # NOTE: We do not shuffle here for reproducibility; the dataset should
             # be shuffled before passing it to the trainer.
-            sampler=sampler,
-            shuffle=False if sampler else True,
+            shuffle=False,
+            drop_last=True,
         )
+        num_batches = len(dl)
+        print(f"Rank {dist.get_rank()} has {num_batches} batches.")
 
         pbar = tqdm(
             desc="Training", 
@@ -214,12 +221,16 @@ class SaeTrainer:
             hidden_dict[name] = outputs.flatten(0, 1)
 
         for batch in dl:
+            # Synchronize at the start of each batch processing to ensure all processes are in sync
+            if dist.is_initialized():
+                dist.barrier()
+
             hidden_dict.clear()
 
             # Bookkeeping for dead feature detection
             num_tokens_in_step += batch["input_ids"].numel()
 
-            # Forward pass on the model to get the next batch of activations            
+            # Forward pass on the model to get the next batch of activations
             handles = [
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
@@ -230,6 +241,7 @@ class SaeTrainer:
                 for handle in handles:
                     handle.remove()
 
+            # Scatter hiddens if distributing modules
             if self.cfg.distribute_modules:
                 hidden_dict = self.scatter_hiddens(hidden_dict)
 
@@ -238,28 +250,21 @@ class SaeTrainer:
 
                 # On the first iteration, initialize the decoder bias
                 if self.global_step == 0:
-                    # NOTE: The all-cat here could conceivably cause an OOM in some
-                    # cases, but it's unlikely to be a problem with small world sizes.
-                    # We could avoid this by "approximating" the geometric median
-                    # across all ranks with the mean (median?) of the geometric medians
-                    # on each rank. Not clear if that would hurt performance.
                     median = geometric_median(self.maybe_all_cat(hiddens))
                     raw.b_dec.data = median.to(raw.dtype)
 
                 if not maybe_wrapped:
-                    # Wrap the SAEs with Distributed Data Parallel. We have to do this
-                    # after we set the decoder bias, otherwise DDP will not register
-                    # gradients flowing to the bias after the first step.
+                    # Wrap the SAEs with Distributed Data Parallel
                     maybe_wrapped = (
                         {
-                            name: DDP(sae, device_ids=[dist.get_rank()])
+                            name: DDP(sae, device_ids=[device], output_device=device)
                             for name, sae in self.saes.items()
                         }
                         if ddp
                         else self.saes
                     )
 
-                # Make sure the W_dec is still unit-norm
+                # Ensure the decoder weights are unit-norm
                 if raw.cfg.normalize_decoder:
                     raw.set_decoder_norm_to_unit_norm()
 
@@ -291,7 +296,9 @@ class SaeTrainer:
                             self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
                         )
 
-                    loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8
+                    loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss
+                    if self.cfg.sae.multi_topk:
+                        loss += out.multi_topk_fvu / 8
                     loss.div(acc_steps).backward()
 
                     # Update the did_fire mask
@@ -301,7 +308,7 @@ class SaeTrainer:
                 # Clip gradient norm independently for each SAE
                 torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
 
-            # Check if we need to actually do a training step
+            # Perform optimizer step if necessary
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
             if substep == 0:
                 if self.cfg.sae.normalize_decoder:
@@ -312,7 +319,6 @@ class SaeTrainer:
                 self.optimizer.zero_grad()
                 self.lr_scheduler.step()
 
-                ###############
                 with torch.no_grad():
                     # Update the dead feature mask
                     for name, counts in self.num_tokens_since_fired.items():
@@ -363,9 +369,13 @@ class SaeTrainer:
 
                 if (step + 1) % self.cfg.save_every == 0:
                     self.save()
-                
+
             self.global_step += 1
             pbar.update()
+
+    # Synchronize at the end of each batch processing
+    if dist.is_initialized():
+        dist.barrier()
 
         self.save()
         pbar.close()
