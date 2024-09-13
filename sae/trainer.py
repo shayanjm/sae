@@ -485,25 +485,41 @@ class SaeTrainer:
 
         path = self.cfg.run_name or "sae-ckpts"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Log the start of the save process
+        print(f"Rank {rank} entering save()")
 
         if rank_zero or self.cfg.distribute_modules:
-            print("Saving checkpoint")
+            print(f"Rank {rank} is saving checkpoints.")
 
             for hook, sae in self.saes.items():
                 assert isinstance(sae, Sae)
+                print(f"Rank {rank} is saving SAE for hook {hook}.")
+                try:
+                    sae.save_to_disk(f"{path}/{hook}")
+                    print(f"Rank {rank} successfully saved SAE for hook {hook}.")
+                except Exception as e:
+                    print(f"Rank {rank} encountered an error while saving SAE for hook {hook}: {e}")
+                    raise e  # Re-raise to not mask the exception
 
-                sae.save_to_disk(f"{path}/{hook}")
-    
         if rank_zero:
-            torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
-            torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
-            torch.save({
-                "global_step": self.global_step,
-                "num_tokens_since_fired": self.num_tokens_since_fired,
-            }, f"{path}/state.pt")
-
-            self.cfg.save_json(f"{path}/config.json")
+            print(f"Rank {rank} is saving optimizer and scheduler.")
+            try:
+                torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
+                torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
+                torch.save({
+                    "global_step": self.global_step,
+                    "num_tokens_since_fired": self.num_tokens_since_fired,
+                }, f"{path}/state.pt")
+                self.cfg.save_json(f"{path}/config.json")
+                print(f"Rank {rank} successfully saved optimizer, scheduler, and state.")
+            except Exception as e:
+                print(f"Rank {rank} encountered an error while saving state: {e}")
+                raise e
 
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
+            print(f"Rank {rank} reached final barrier.")
             dist.barrier()
+            print(f"Rank {rank} passed final barrier.") 
