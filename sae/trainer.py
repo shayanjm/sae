@@ -11,6 +11,7 @@ from safetensors.torch import load_model
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
@@ -159,13 +160,26 @@ class SaeTrainer:
             ds = self.dataset
 
         device = self.model.device
+
+        if dist.is_initialized():
+            sampler = DistributedSampler(
+                ds,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=False,
+                )
+        else:
+            sampler = None
+
         dl = DataLoader(
             ds, # type: ignore
             batch_size=self.cfg.batch_size,
             # NOTE: We do not shuffle here for reproducibility; the dataset should
             # be shuffled before passing it to the trainer.
-            shuffle=False,
+            sampler=sampler,
+            shuffle=False if sampler else True,
         )
+
         pbar = tqdm(
             desc="Training", 
             disable=not rank_zero, 

@@ -5,6 +5,7 @@ from multiprocessing import cpu_count
 
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from datasets import Dataset, load_dataset
 from simple_parsing import field, parse
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel
@@ -35,6 +36,9 @@ class RunConfig(TrainConfig):
 
     hf_token: str | None = None
     """Huggingface API token for downloading models."""
+
+    text_key: str | None = "text"
+    """The key in the dataset to use as the text to tokenize."""
 
     load_in_8bit: bool = False
     """Load the model in 8-bit mode."""
@@ -101,6 +105,7 @@ def load_artifacts(args: RunConfig, rank: int) -> tuple[PreTrainedModel, Dataset
                 tokenizer,
                 max_seq_len=args.ctx_len,
                 num_proc=args.data_preprocessing_num_proc,
+                text_key=args.text_key,
             )
         else:
             print("Dataset already tokenized; skipping tokenization.")
@@ -114,7 +119,7 @@ def load_artifacts(args: RunConfig, rank: int) -> tuple[PreTrainedModel, Dataset
 
     return model, dataset
 
-
+@record
 def run():
     local_rank = os.environ.get("LOCAL_RANK")
     ddp = local_rank is not None
