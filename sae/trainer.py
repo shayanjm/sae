@@ -200,12 +200,13 @@ class SaeTrainer:
         else:
             num_batches = len(dl)
 
-        pbar = tqdm(
-            desc="Training", 
-            disable=not rank_zero, 
-            initial=self.global_step, 
-            total=num_batches,
-        )
+        # Initialize the progress bar using len(dl)
+        if rank_zero:
+            pbar = tqdm(
+                desc="Training",
+                total=len(dl),
+                initial=0,
+            )
 
         did_fire = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.bool)
@@ -384,14 +385,23 @@ class SaeTrainer:
                     self.save()
 
             self.global_step += 1
-            pbar.update()
 
-        # Synchronize at the end of each batch processing
+            # Update the progress bar only in rank 0
+            if rank_zero:
+                pbar.update(1)
+
+            # Synchronize at the end of each batch processing
+            if dist.is_initialized():
+                dist.barrier()
+
+        # Close the progress bar
+        if rank_zero:
+            pbar.close()
+
+        # Save at the end
         if dist.is_initialized():
             dist.barrier()
-
             self.save()
-            pbar.close()
 
     def local_hookpoints(self) -> list[str]:
         return (
