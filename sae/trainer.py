@@ -187,6 +187,19 @@ class SaeTrainer:
         num_batches = len(dl)
         print(f"Rank {dist.get_rank()} has {num_batches} batches.")
 
+        if dist.is_initialized():
+            total_samples = len(dl.dataset)
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            # Calculate the number of samples per process
+            samples_per_rank = total_samples // world_size
+            # Handle any remaining samples in the last rank
+            if rank == world_size - 1:
+                samples_per_rank += total_samples % world_size
+            num_batches = samples_per_rank // self.cfg.batch_size
+        else:
+            num_batches = len(dl)
+
         pbar = tqdm(
             desc="Training", 
             disable=not rank_zero, 
