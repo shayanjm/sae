@@ -386,12 +386,12 @@ class SaeTrainer:
             self.global_step += 1
             pbar.update()
 
-    # Synchronize at the end of each batch processing
-    if dist.is_initialized():
-        dist.barrier()
+        # Synchronize at the end of each batch processing
+        if dist.is_initialized():
+            dist.barrier()
 
-        self.save()
-        pbar.close()
+            self.save()
+            pbar.close()
 
     def local_hookpoints(self) -> list[str]:
         return (
