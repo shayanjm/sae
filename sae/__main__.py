@@ -146,15 +146,15 @@ def run():
         dataset = dataset.shard(dist.get_world_size(), rank)
 
     # Prevent ranks other than 0 from printing
-    with nullcontext() if rank == 0 else redirect_stdout(None):
-        print(f"Training on '{args.dataset}' (split '{args.split}')")
-        print(f"Storing model weights in {model.dtype}")
+    # with nullcontext() if rank == 0 else redirect_stdout(None):
+    print(f"Training on '{args.dataset}' (split '{args.split}')")
+    print(f"Storing model weights in {model.dtype}")
 
-        trainer = SaeTrainer(args, dataset, model)
-        if args.resume:
-            trainer.load_state(args.run_name or "sae-ckpts")
+    trainer = SaeTrainer(args, dataset, model)
+    if args.resume:
+        trainer.load_state(args.run_name or "sae-ckpts")
 
-        trainer.fit()
+    trainer.fit()
 
 
 if __name__ == "__main__":

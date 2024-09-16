@@ -241,12 +241,13 @@ class SaeTrainer:
                 name = module_to_name[module]
                 hidden_dict[name] = outputs.flatten(0, 1)
 
+            batch_num = 0
             for batch in dl:
                 # Synchronize at the start of each batch processing to ensure all processes are in sync
                 if dist.is_initialized():
                     dist.barrier()
-
                 hidden_dict.clear()
+                print(f"Synchronized at beginning of batch {batch_num} and cleared hidden_dict")
 
                 # Bookkeeping for dead feature detection
                 num_tokens_in_step += batch["input_ids"].numel()
@@ -400,6 +401,8 @@ class SaeTrainer:
                 # Synchronize at the end of each batch processing
                 if dist.is_initialized():
                     dist.barrier()
+                print(f"Synchronized at end of {batch_num}")
+                batch_num += 1
 
         # Close the progress bar
         if rank_zero:
@@ -407,7 +410,9 @@ class SaeTrainer:
 
         # Save at the end
         if dist.is_initialized():
+            print("Dist is initialized. Passing barrier")
             dist.barrier()
+            print("Past barrier. Saving...")
             self.save()
 
     def local_hookpoints(self) -> list[str]:
