@@ -160,28 +160,19 @@ class SaeTrainer:
             ds = self.dataset
 
         device = self.model.device
-
+        sampler = None
         if dist.is_initialized():
             world_size = dist.get_world_size()
             rank = dist.get_rank()
-            total_samples = len(ds)
-            samples_per_rank = total_samples // world_size
-
-            start_index = rank * samples_per_rank
-            # Ensure the last rank takes any leftover samples
-            end_index = start_index + samples_per_rank if rank != world_size - 1 else total_samples
-
-            indices = list(range(start_index, end_index))
-            subset_ds = torch.utils.data.Subset(ds, indices)
-        else:
-            subset_ds = ds
+            sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
         
         dl = DataLoader(
-            subset_ds, # type: ignore
+            ds, # type: ignore
             batch_size=self.cfg.batch_size,
             # NOTE: We do not shuffle here for reproducibility; the dataset should
             # be shuffled before passing it to the trainer.
             shuffle=False,
+            sampler=sampler,
             drop_last=True,
         )
         num_batches = len(dl)
