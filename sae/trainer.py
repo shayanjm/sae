@@ -208,191 +208,198 @@ class SaeTrainer:
                 initial=0,
             )
 
-        did_fire = {
-            name: torch.zeros(sae.num_latents, device=device, dtype=torch.bool)
-            for name, sae in self.saes.items()
-        }
-        num_tokens_in_step = 0
-
-        # For logging purposes
-        avg_auxk_loss = defaultdict(float)
-        avg_fvu = defaultdict(float)
-        avg_multi_topk_fvu = defaultdict(float)
-
-        hidden_dict: dict[str, Tensor] = {}
-        name_to_module = {
-            name: self.model.get_submodule(name) for name in self.cfg.hookpoints
-        }
-        maybe_wrapped: dict[str, DDP] | dict[str, Sae] = {}
-        module_to_name = {v: k for k, v in name_to_module.items()}
-
-        def hook(module: nn.Module, _, outputs):
-            # Maybe unpack tuple outputs
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-
-            name = module_to_name[module]
-            hidden_dict[name] = outputs.flatten(0, 1)
-
-        for batch in dl:
-            # Synchronize at the start of each batch processing to ensure all processes are in sync
+        # Check if DataLoader is empty
+        if len(dl) == 0:
+            # Even if no data, need to synchronize with other ranks
             if dist.is_initialized():
                 dist.barrier()
+        
+        else:
+            did_fire = {
+                name: torch.zeros(sae.num_latents, device=device, dtype=torch.bool)
+                for name, sae in self.saes.items()
+            }
+            num_tokens_in_step = 0
 
-            hidden_dict.clear()
+            # For logging purposes
+            avg_auxk_loss = defaultdict(float)
+            avg_fvu = defaultdict(float)
+            avg_multi_topk_fvu = defaultdict(float)
 
-            # Bookkeeping for dead feature detection
-            num_tokens_in_step += batch["input_ids"].numel()
+            hidden_dict: dict[str, Tensor] = {}
+            name_to_module = {
+                name: self.model.get_submodule(name) for name in self.cfg.hookpoints
+            }
+            maybe_wrapped: dict[str, DDP] | dict[str, Sae] = {}
+            module_to_name = {v: k for k, v in name_to_module.items()}
 
-            # Forward pass on the model to get the next batch of activations
-            handles = [
-                mod.register_forward_hook(hook) for mod in name_to_module.values()
-            ]
-            try:
-                with torch.no_grad():
-                    self.model(batch["input_ids"].to(device))
-            finally:
-                for handle in handles:
-                    handle.remove()
+            def hook(module: nn.Module, _, outputs):
+                # Maybe unpack tuple outputs
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
 
-            # Scatter hiddens if distributing modules
-            if self.cfg.distribute_modules:
-                hidden_dict = self.scatter_hiddens(hidden_dict)
+                name = module_to_name[module]
+                hidden_dict[name] = outputs.flatten(0, 1)
 
-            for name, hiddens in hidden_dict.items():
-                raw = self.saes[name]  # 'raw' never has a DDP wrapper
+            for batch in dl:
+                # Synchronize at the start of each batch processing to ensure all processes are in sync
+                if dist.is_initialized():
+                    dist.barrier()
 
-                # On the first iteration, initialize the decoder bias
-                if self.global_step == 0:
-                    median = geometric_median(self.maybe_all_cat(hiddens))
-                    raw.b_dec.data = median.to(raw.dtype)
+                hidden_dict.clear()
 
-                if not maybe_wrapped:
-                    # Wrap the SAEs with Distributed Data Parallel
-                    maybe_wrapped = (
-                        {
-                            name: DDP(sae, device_ids=[device], output_device=device)
-                            for name, sae in self.saes.items()
-                        }
-                        if ddp
-                        else self.saes
-                    )
+                # Bookkeeping for dead feature detection
+                num_tokens_in_step += batch["input_ids"].numel()
 
-                # Ensure the decoder weights are unit-norm
-                if raw.cfg.normalize_decoder:
-                    raw.set_decoder_norm_to_unit_norm()
+                # Forward pass on the model to get the next batch of activations
+                handles = [
+                    mod.register_forward_hook(hook) for mod in name_to_module.values()
+                ]
+                try:
+                    with torch.no_grad():
+                        self.model(batch["input_ids"].to(device))
+                finally:
+                    for handle in handles:
+                        handle.remove()
 
-                acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
-                denom = acc_steps * self.cfg.wandb_log_frequency
-                wrapped = maybe_wrapped[name]
+                # Scatter hiddens if distributing modules
+                if self.cfg.distribute_modules:
+                    hidden_dict = self.scatter_hiddens(hidden_dict)
 
-                # Save memory by chunking the activations
-                for chunk in hiddens.chunk(self.cfg.micro_acc_steps):
-                    out = wrapped(
-                        chunk,
-                        dead_mask=(
-                            self.num_tokens_since_fired[name]
-                            > self.cfg.dead_feature_threshold
-                            if self.cfg.auxk_alpha > 0
-                            else None
-                        ),
-                    )
+                for name, hiddens in hidden_dict.items():
+                    raw = self.saes[name]  # 'raw' never has a DDP wrapper
 
-                    avg_fvu[name] += float(
-                        self.maybe_all_reduce(out.fvu.detach()) / denom
-                    )
-                    if self.cfg.auxk_alpha > 0:
-                        avg_auxk_loss[name] += float(
-                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                        )
-                    if self.cfg.sae.multi_topk:
-                        avg_multi_topk_fvu[name] += float(
-                            self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
-                        )
+                    # On the first iteration, initialize the decoder bias
+                    if self.global_step == 0:
+                        median = geometric_median(self.maybe_all_cat(hiddens))
+                        raw.b_dec.data = median.to(raw.dtype)
 
-                    loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss
-                    if self.cfg.sae.multi_topk:
-                        loss += out.multi_topk_fvu / 8
-                    loss.div(acc_steps).backward()
-
-                    # Update the did_fire mask
-                    did_fire[name][out.latent_indices.flatten()] = True
-                    self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
-
-                # Clip gradient norm independently for each SAE
-                torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
-
-            # Perform optimizer step if necessary
-            step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
-            if substep == 0:
-                if self.cfg.sae.normalize_decoder:
-                    for sae in self.saes.values():
-                        sae.remove_gradient_parallel_to_decoder_directions()
-
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                self.lr_scheduler.step()
-
-                with torch.no_grad():
-                    # Update the dead feature mask
-                    for name, counts in self.num_tokens_since_fired.items():
-                        counts += num_tokens_in_step
-                        counts[did_fire[name]] = 0
-
-                    # Reset stats for this step
-                    num_tokens_in_step = 0
-                    for mask in did_fire.values():
-                        mask.zero_()
-
-                if (
-                    self.cfg.log_to_wandb
-                    and (step + 1) % self.cfg.wandb_log_frequency == 0
-                ):
-                    info = {}
-
-                    for name in self.saes:
-                        mask = (
-                            self.num_tokens_since_fired[name]
-                            > self.cfg.dead_feature_threshold
-                        )
-
-                        info.update(
+                    if not maybe_wrapped:
+                        # Wrap the SAEs with Distributed Data Parallel
+                        maybe_wrapped = (
                             {
-                                f"fvu/{name}": avg_fvu[name],
-                                f"dead_pct/{name}": mask.mean(
-                                    dtype=torch.float32
-                                ).item(),
+                                name: DDP(sae, device_ids=[device], output_device=device)
+                                for name, sae in self.saes.items()
                             }
+                            if ddp
+                            else self.saes
+                        )
+
+                    # Ensure the decoder weights are unit-norm
+                    if raw.cfg.normalize_decoder:
+                        raw.set_decoder_norm_to_unit_norm()
+
+                    acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+                    denom = acc_steps * self.cfg.wandb_log_frequency
+                    wrapped = maybe_wrapped[name]
+
+                    # Save memory by chunking the activations
+                    for chunk in hiddens.chunk(self.cfg.micro_acc_steps):
+                        out = wrapped(
+                            chunk,
+                            dead_mask=(
+                                self.num_tokens_since_fired[name]
+                                > self.cfg.dead_feature_threshold
+                                if self.cfg.auxk_alpha > 0
+                                else None
+                            ),
+                        )
+
+                        avg_fvu[name] += float(
+                            self.maybe_all_reduce(out.fvu.detach()) / denom
                         )
                         if self.cfg.auxk_alpha > 0:
-                            info[f"auxk/{name}"] = avg_auxk_loss[name]
+                            avg_auxk_loss[name] += float(
+                                self.maybe_all_reduce(out.auxk_loss.detach()) / denom
+                            )
                         if self.cfg.sae.multi_topk:
-                            info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
+                            avg_multi_topk_fvu[name] += float(
+                                self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                            )
 
-                    avg_auxk_loss.clear()
-                    avg_fvu.clear()
-                    avg_multi_topk_fvu.clear()
+                        loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss
+                        if self.cfg.sae.multi_topk:
+                            loss += out.multi_topk_fvu / 8
+                        loss.div(acc_steps).backward()
 
-                    if self.cfg.distribute_modules:
-                        outputs = [{} for _ in range(dist.get_world_size())]
-                        dist.gather_object(info, outputs if rank_zero else None)
-                        info.update({k: v for out in outputs for k, v in out.items()})
+                        # Update the did_fire mask
+                        did_fire[name][out.latent_indices.flatten()] = True
+                        self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
-                    if rank_zero:
-                        wandb.log(info, step=step)
+                    # Clip gradient norm independently for each SAE
+                    torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
 
-                if (step + 1) % self.cfg.save_every == 0:
-                    self.save()
+                # Perform optimizer step if necessary
+                step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
+                if substep == 0:
+                    if self.cfg.sae.normalize_decoder:
+                        for sae in self.saes.values():
+                            sae.remove_gradient_parallel_to_decoder_directions()
 
-            self.global_step += 1
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.lr_scheduler.step()
 
-            # Update the progress bar only in rank 0
-            if rank_zero:
-                pbar.update(1)
+                    with torch.no_grad():
+                        # Update the dead feature mask
+                        for name, counts in self.num_tokens_since_fired.items():
+                            counts += num_tokens_in_step
+                            counts[did_fire[name]] = 0
 
-            # Synchronize at the end of each batch processing
-            if dist.is_initialized():
-                dist.barrier()
+                        # Reset stats for this step
+                        num_tokens_in_step = 0
+                        for mask in did_fire.values():
+                            mask.zero_()
+
+                    if (
+                        self.cfg.log_to_wandb
+                        and (step + 1) % self.cfg.wandb_log_frequency == 0
+                    ):
+                        info = {}
+
+                        for name in self.saes:
+                            mask = (
+                                self.num_tokens_since_fired[name]
+                                > self.cfg.dead_feature_threshold
+                            )
+
+                            info.update(
+                                {
+                                    f"fvu/{name}": avg_fvu[name],
+                                    f"dead_pct/{name}": mask.mean(
+                                        dtype=torch.float32
+                                    ).item(),
+                                }
+                            )
+                            if self.cfg.auxk_alpha > 0:
+                                info[f"auxk/{name}"] = avg_auxk_loss[name]
+                            if self.cfg.sae.multi_topk:
+                                info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
+
+                        avg_auxk_loss.clear()
+                        avg_fvu.clear()
+                        avg_multi_topk_fvu.clear()
+
+                        if self.cfg.distribute_modules:
+                            outputs = [{} for _ in range(dist.get_world_size())]
+                            dist.gather_object(info, outputs if rank_zero else None)
+                            info.update({k: v for out in outputs for k, v in out.items()})
+
+                        if rank_zero:
+                            wandb.log(info, step=step)
+
+                    if (step + 1) % self.cfg.save_every == 0:
+                        self.save()
+
+                self.global_step += 1
+
+                # Update the progress bar only in rank 0
+                if rank_zero:
+                    pbar.update(1)
+
+                # Synchronize at the end of each batch processing
+                if dist.is_initialized():
+                    dist.barrier()
 
         # Close the progress bar
         if rank_zero:
