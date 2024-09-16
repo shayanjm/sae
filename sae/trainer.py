@@ -354,6 +354,7 @@ class SaeTrainer:
                         print(f"Updated did_fire[{name}]. Performing `maybe_all_reduce(did_fire[{name}], 'max')...")
                         self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
                         print(f"Finished all_reduce")
+                        chunk_num += 1
 
                     # Clip gradient norm independently for each SAE
                     print("Clipping gradient norm...")
