@@ -125,6 +125,8 @@ def run():
     ddp = local_rank is not None
     rank = int(local_rank) if ddp else 0
 
+    print(f"LOCAL RANK: {local_rank}")
+
     if ddp:
         torch.cuda.set_device(int(local_rank))
         dist.init_process_group("nccl")
