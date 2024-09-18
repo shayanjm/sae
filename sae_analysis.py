@@ -231,7 +231,7 @@ def main():
                         latent_indices = forward_output.latent_indices # Top-k latent indices
 
                     # Compute activation mask on GPU
-                    activation_mask = (latent_acts != 0) & (latent_acts >= activation_threshold)
+                    activation_mask = latent_acts >= activation_threshold
 
                     # Correctly sum over the latent dimension
                     activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Correct latent dim shape
