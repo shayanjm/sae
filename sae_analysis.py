@@ -153,9 +153,9 @@ def main():
     logger.info(f"Rank {rank}: DataLoader length: {len(data_loader)}")
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, activation_threshold, latent_dim, device, token_batch_size=2048):
-        # Initialize activation counts with the shape of the latent dimensions (192 in this case)
-        activation_counts = np.zeros(latent_dim)  # Corrected to latent dimension (192)
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device, token_batch_size=2048):
+        # Initialize activation counts with the latent dimension
+        activation_counts = np.zeros(latent_dim)
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)  # Using defaultdict for efficiency
 
@@ -230,11 +230,12 @@ def main():
                         latent_acts = forward_output.latent_acts # Top-k latent activations
                         latent_indices = forward_output.latent_indices # Top-k latent indices
 
-                    # Compute activation mask on GPU
-                    activation_mask = latent_acts >= activation_threshold
+                    # Create the activation mask using the top-k indices
+                    activation_mask = torch.zeros_like(residuals, dtype=torch.bool)  # Initialize a zero mask
+                    activation_mask.scatter_(1, latent_indices, 1)  # Set mask at top-k indices to 1 (activated)
 
-                    # Correctly sum over the latent dimension
-                    activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Correct latent dim shape
+                    # Proper summing over the latent dimension
+                    activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Summing across latents only
 
                     # Get indices of active neurons and tokens
                     active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
@@ -288,6 +289,7 @@ def main():
         progress_bar.close()
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
+ 
 
  
 
