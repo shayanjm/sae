@@ -152,8 +152,8 @@ def main():
     all_token_context_maps = {}
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, expansion_factor, device, args):
-        activation_counts = np.zeros(latent_dim)
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, d_in, expansion_factor, device, args):
+        activation_counts = np.zeros(d_in * expansion_factor)
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)
         token_context_map = {}
@@ -310,18 +310,19 @@ def main():
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
+            
+            # Extract d_in from sae_cfg
+            if hasattr(sae_cfg, 'd_in'):
+                d_in = sae_cfg.d_in
+                logger.info(f"Rank {rank}: d_in for {layer_to_analyze}: {d_in}")
+            else:
+                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'd_in'")
+                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'd_in'")
 
-            # Calculate adjusted latent_dim
-            # Based on the provided facts:
-            # total neurons = batch_size * expansion_factor * max_token_length = 2 * 32 * 2048 = 131072
-            # latent_dim * max_token_length * batch_size = 192 * 2048 * 2 = 786432
-            # Thus, per token, latent_dim = 192, but total neurons per token = 32
-            # This suggests that latent_dim should be adjusted to match the expansion_factor
-            # Therefore, latent_dim should be set to expansion_factor (32)
 
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, expansion_factor, device, args
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, d_in, expansion_factor, device, args
             )
 
             # Accumulate total_tokens
