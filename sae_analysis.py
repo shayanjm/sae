@@ -11,7 +11,7 @@ import json
 import math
 from tqdm import tqdm
 from safetensors.torch import load_file
-from sae import Sae, ForwardOutput, EncoderOutput
+from sae.sae import Sae, ForwardOutput, EncoderOutput
 import argparse
 from torch.distributed.elastic.multiprocessing.errors import record
 import logging
@@ -154,7 +154,7 @@ def main():
 
     # Function to process data loader
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, activation_threshold, latent_dim, device, token_batch_size=2048):
-        activation_counts = np.zeros(latent_dim)
+        activation_counts = np.zeros(latent_dim)  # Adjusted to the number of latents (192 in this case)
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)  # Using defaultdict for efficiency
 
@@ -232,8 +232,8 @@ def main():
                     # Compute activation mask on GPU
                     activation_mask = (latent_acts != 0) & (latent_acts >= activation_threshold)
 
-                    # Update activation counts
-                    activation_counts += activation_mask.sum(dim=0).cpu().numpy()
+                    # Update activation counts (using latent dimension, not token dimension)
+                    activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Correct latent dim shape
 
                     # Get indices of active neurons and tokens
                     active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
@@ -287,6 +287,7 @@ def main():
         progress_bar.close()
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
+ 
 
     # Set an activation threshold to filter significant activations
     activation_threshold = args.activation_threshold  # Use the value from arguments
