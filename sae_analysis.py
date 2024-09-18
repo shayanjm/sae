@@ -204,6 +204,8 @@ def main():
                 # Flatten token IDs and move to CPU for tokenization
                 token_ids = input_ids.view(-1).cpu().numpy()  # Shape: [batch_size * seq_length]
                 tokens = tokenizer.convert_ids_to_tokens(token_ids)
+                logger.info(f"tokens.shape: {tokens.shape}")
+                torch.save(tokens, f'{layer_to_analyze}_tokens.pt')
 
                 # Precompute full token sequences for each example in the batch
                 tokens_full_list = []
