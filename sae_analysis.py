@@ -232,9 +232,12 @@ def main():
 
                 # Create the activation mask
                 activation_mask = torch.zeros(token_batch_size, num_latents, dtype=torch.bool, device=device)
+                activation_values = torch.zeros(token_batch_size, num_latents, dtype=torch.float32, device=device)
                 logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
+                activation_values.scatter_(1, latent_indices, latent_acts)
                 logger.info(f"Max latent index: {latent_indices}")
+                logger.info(f"Max latent activation value: {activation_values.max()}")
                 logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
                 logger.info(f"Shape of Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0).shape}")
                 # Proper summing over the latent dimension
@@ -246,13 +249,6 @@ def main():
                 logger.info(f"active_token_indices.shape: {active_token_indices.shape}")
                 logger.info(f"active_neuron_indices.shape: {active_neuron_indices.shape}")
                 logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
-
-                # Extract activation values safely
-                activation_values = latent_acts[active_token_indices, active_neuron_indices]
-
-                # Move indices to CPU for further processing
-                active_token_indices = active_token_indices
-                active_neuron_indices = active_neuron_indices
 
                 # Process activations
                 for idx in range(len(active_token_indices)):
