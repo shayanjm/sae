@@ -51,7 +51,7 @@ def main():
     sae_directory = args.sae_directory
 
     # Set the device for each process
-    device = torch.device('cuda', rank) if torch.cuda.is available() else 'cpu'
+    device = torch.device('cuda', rank) if torch.cuda.is_available() else 'cpu'
     logger.info(f"Rank {rank}/{world_size}, using device: {device}")
 
     # Load the tokenizer and model from arguments
