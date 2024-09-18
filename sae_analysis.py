@@ -145,13 +145,21 @@ def main():
     # Log DataLoader length
     logger.info(f"Rank {rank}: DataLoader length: {len(data_loader)}")
 
+    # Initialize variables to accumulate results
+    total_tokens_rank = 0
+    all_activation_counts = []
+    all_neuron_activation_texts = defaultdict(list)
+    all_token_context_maps = {}
+
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device, token_batch_size=2048):
-        # Initialize activation counts with the latent dimension
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device, args):
         activation_counts = np.zeros(latent_dim)
         total_tokens = 0
-        neuron_activation_texts = defaultdict(list)  # Using defaultdict for efficiency
+        neuron_activation_texts = defaultdict(list)
+        token_context_map = {}
+        token_context_counter = 0
 
+        # Extract layer index (assuming layer_to_analyze is in the format 'layer.X')
         layer_idx = int(layer_to_analyze.split('.')[-1])
 
         # Initialize progress bar with position=rank
@@ -165,9 +173,6 @@ def main():
             position=rank,
             leave=False  # Adjust as needed
         )
-
-        token_context_map = {}
-        token_context_counter = 0
 
         for batch_idx_in_loader, batch in progress_bar:
             try:
@@ -184,7 +189,7 @@ def main():
                     hidden_states = outputs.hidden_states
 
                 # Corrected indexing for residuals
-                residuals = hidden_states[layer_idx + 1]  # Corrected indexing
+                residuals = hidden_states[layer_idx + 1]  # Shape: [batch_size, seq_length, hidden_size]
 
                 # Reshape residuals to [batch_size * seq_length, hidden_size]
                 residuals = residuals.view(batch_size_ * seq_length, -1)
@@ -195,11 +200,6 @@ def main():
                 token_ids = input_ids.view(-1).cpu().numpy()  # Shape: [batch_size * seq_length]
                 tokens = tokenizer.convert_ids_to_tokens(token_ids)
 
-                # Precompute batch and sequence indices
-                indices_in_residuals = np.arange(token_batch_size)
-                batch_idx_array = indices_in_residuals // seq_length
-                seq_idx_array = indices_in_residuals % seq_length
-
                 # Precompute full token sequences for each example in the batch
                 tokens_full_list = []
                 for batch_idx in range(batch_size_):
@@ -207,77 +207,67 @@ def main():
                     tokens_full = tokenizer.convert_ids_to_tokens(input_ids_batch)
                     tokens_full_list.append(tokens_full)
 
-                for i in range(0, residuals.size(0), token_batch_size):
-                    # Batch slicing
-                    token_batch = residuals[i:i+token_batch_size].to(device)
-                    tokens_batch = tokens[i:i+token_batch_size]
-                    batch_idx_array_in_batch = batch_idx_array[i:i+token_batch_size]
-                    seq_idx_array_in_batch = seq_idx_array[i:i+token_batch_size]
+                # Forward pass through SAE model
+                with torch.no_grad():
+                    forward_output = sae_model(residuals)
+                    sae_out = forward_output.sae_out
+                    latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, latent_dim]
+                    latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Shape: [batch_size * seq_length, k]
 
-                    # Compute forward pass through SAE model
-                    with torch.no_grad():
-                        forward_output = sae_model(token_batch)
-                        sae_out = forward_output.sae_out
-                        latent_acts = forward_output.latent_acts
-                        latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Adjust latent_indices shape
+                # Validate latent_indices
+                max_latent_index = latent_indices.max().item()
+                if max_latent_index >= latent_dim:
+                    logger.error(f"latent_indices max {max_latent_index} >= latent_dim {latent_dim}")
+                    raise ValueError(f"latent_indices contain values >= latent_dim ({latent_dim})")
 
-                    # Create the activation mask
-                    activation_mask = torch.zeros(token_batch_size, latent_dim, dtype=torch.bool, device=device)
+                # Create the activation mask
+                activation_mask = torch.zeros(token_batch_size, latent_dim, dtype=torch.bool, device=device)
+                activation_mask.scatter_(1, latent_indices, 1)
 
-                    # Scatter top-k indices into the mask
-                    activation_mask.scatter_(1, latent_indices, 1)
+                # Proper summing over the latent dimension
+                activation_counts += activation_mask.sum(dim=0).cpu().numpy()
 
-                    # Proper summing over the latent dimension
-                    activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Summing across latents only
+                # Get indices of active neurons
+                active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
 
-                    # Get indices of active neurons and tokens
-                    active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
+                logger.info(f"latent_acts.shape: {latent_acts.shape}")
+                logger.info(f"active_token_indices.shape: {active_token_indices.shape}")
+                logger.info(f"active_neuron_indices.shape: {active_neuron_indices.shape}")
+                logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
 
-                    logger.info(f"latent_acts.shape: {latent_acts.shape}")
-                    logger.info(f"active_token_indices.shape: {active_token_indices.shape}")
-                    logger.info(f"active_neuron_indices.shape: {active_neuron_indices.shape}")
-                    logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
+                # Extract activation values safely
+                activation_values = latent_acts[active_token_indices, active_neuron_indices].cpu().numpy()
 
-                    activation_values = latent_acts[active_token_indices, active_neuron_indices].cpu().numpy()
+                # Move indices to CPU for further processing
+                active_token_indices = active_token_indices.cpu().numpy()
+                active_neuron_indices = active_neuron_indices.cpu().numpy()
 
-                    # Move indices to CPU
-                    active_token_indices = active_token_indices.cpu().numpy()
-                    active_neuron_indices = active_neuron_indices.cpu().numpy()
+                # Process activations
+                for idx in range(len(active_token_indices)):
+                    token_index_in_batch = active_token_indices[idx]
+                    neuron_idx = active_neuron_indices[idx]
+                    activation_value = activation_values[idx]
+                    token = tokens[token_index_in_batch]
 
-                    # Process activations
-                    for idx in range(len(active_token_indices)):
-                        token_index_in_batch = active_token_indices[idx]
-                        neuron_idx = active_neuron_indices[idx]
-                        activation_value = activation_values[idx]
-                        token = tokens_batch[token_index_in_batch]
+                    batch_idx = token_index_in_batch // seq_length
+                    seq_idx = token_index_in_batch % seq_length
+                    tokens_full = tokens_full_list[batch_idx]
 
-                        batch_idx = batch_idx_array_in_batch[token_index_in_batch]
-                        seq_idx = seq_idx_array_in_batch[token_index_in_batch]
-                        tokens_full = tokens_full_list[batch_idx]
+                    # Get context window around the token using args.context_window
+                    context_window = args.context_window
+                    start_idx = max(0, seq_idx - context_window)
+                    end_idx = min(len(tokens_full), seq_idx + context_window + 1)
+                    context_tokens = tokens_full[start_idx:end_idx]
+                    context_text = ' '.join(context_tokens)
 
-                        # Get context window around the token using args.context_window
-                        context_window = args.context_window
-                        start_idx = max(0, seq_idx - context_window)
-                        end_idx = min(len(tokens_full), seq_idx + context_window + 1)
-                        context_tokens = tokens_full[start_idx:end_idx]
-                        context_text = ' '.join(context_tokens)
+                    context_key = (token, context_text)
+                    if context_key not in token_context_map:
+                        token_context_map[context_key] = token_context_counter
+                        token_context_counter += 1
 
-                        context_key = (token, context_text)
-                        if context_key not in token_context_map:
-                            token_context_map[context_key] = token_context_counter
-                            token_context_counter += 1
+                    neuron_activation_texts[neuron_idx].append((activation_value, token_context_map[context_key]))
 
-                        neuron_activation_texts[neuron_idx].append((activation_value.item(), token_context_map[context_key]))
-
-                    # Free up GPU memory
-                    del token_batch, sae_out, latent_acts, latent_indices
-                    torch.cuda.empty_cache()
-
-                # Free up GPU memory
-                del input_ids, attention_mask, outputs, hidden_states, residuals
-                torch.cuda.empty_cache()
-
-                # Update progress bar (optional)
+                # Update progress bar
                 progress_bar.set_postfix({'Total Tokens': total_tokens})
 
             except Exception as e:
@@ -301,12 +291,28 @@ def main():
 
             logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
 
-            # Initialize variables to track activations and neuron activations
-            latent_dim = sae_model.num_latents
+            # Extract expansion_factor from sae_cfg
+            if hasattr(sae_cfg, 'expansion_factor'):
+                expansion_factor = sae_cfg.expansion_factor
+                logger.info(f"Rank {rank}: expansion_factor for {layer_to_analyze}: {expansion_factor}")
+            else:
+                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
+                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
+
+            # Calculate adjusted latent_dim
+            # Based on the provided facts:
+            # total neurons = batch_size * expansion_factor * max_token_length = 2 * 32 * 2048 = 131072
+            # latent_dim * max_token_length * batch_size = 192 * 2048 * 2 = 786432
+            # Thus, per token, latent_dim = 192, but total neurons per token = 32
+            # This suggests that latent_dim should be adjusted to match the expansion_factor
+            # Therefore, latent_dim should be set to expansion_factor (32)
+
+            latent_dim = expansion_factor  # Set latent_dim to expansion_factor=32
+            logger.info(f"Rank {rank}: Set latent_dim to expansion_factor: {latent_dim}")
 
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device, args
             )
 
             # Accumulate total_tokens
@@ -329,20 +335,29 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # Save activation counts as memory-mapped arrays
-    np.save(os.path.join(output_dir, f'all_activation_counts_{rank}.npy'), np.concatenate(all_activation_counts))
+    if all_activation_counts:
+        np.save(os.path.join(output_dir, f'all_activation_counts_{rank}.npy'), np.concatenate(all_activation_counts))
+    else:
+        logger.warning(f"Rank {rank}: No activation counts to save.")
 
     # Save neuron activations as Parquet for fast reading
-    neuron_activation_df = pd.DataFrame([
-        {'neuron_idx': k, 'activation_value': a, 'context_index': c}
-        for k, v in all_neuron_activation_texts.items() for a, c in v
-    ])
-    output_file_texts = os.path.join(output_dir, f'neuron_activation_texts_{rank}.parquet')
-    neuron_activation_df.to_parquet(output_file_texts)
+    if all_neuron_activation_texts:
+        neuron_activation_df = pd.DataFrame([
+            {'neuron_idx': k, 'activation_value': a, 'context_index': c}
+            for k, v in all_neuron_activation_texts.items() for a, c in v
+        ])
+        output_file_texts = os.path.join(output_dir, f'neuron_activation_texts_{rank}.parquet')
+        neuron_activation_df.to_parquet(output_file_texts)
+    else:
+        logger.warning(f"Rank {rank}: No neuron activations to save.")
 
     # Save token context map as Parquet
-    token_context_df = pd.DataFrame(list(all_token_context_maps.items()), columns=['context_key', 'context_index'])
-    output_file_context_map = os.path.join(output_dir, f'context_map_{rank}.parquet')
-    token_context_df.to_parquet(output_file_context_map)
+    if all_token_context_maps:
+        token_context_df = pd.DataFrame(list(all_token_context_maps.items()), columns=['context_key', 'context_index'])
+        output_file_context_map = os.path.join(output_dir, f'context_map_{rank}.parquet')
+        token_context_df.to_parquet(output_file_context_map)
+    else:
+        logger.warning(f"Rank {rank}: No token context maps to save.")
 
     logger.info(f"Rank {rank}: All results saved.")
 
