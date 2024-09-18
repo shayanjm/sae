@@ -232,6 +232,12 @@ def main():
 
                     # Get indices of active neurons and tokens
                     active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
+
+                    logger.info(f"latent_acts.shape: {latent_acts.shape}")
+                    logger.info(f"active_token_indices.shape: {active_token_indices.shape}")
+                    logger.info(f"active_neuron_indices.shape: {active_neuron_indices.shape}")
+                    logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
+
                     activation_values = latent_acts[active_token_indices, active_neuron_indices].cpu().numpy()
 
                     # Move indices to CPU
