@@ -152,7 +152,7 @@ def main():
     all_token_context_maps = {}
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device, args):
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, expansion_factor, device, args):
         activation_counts = np.zeros(latent_dim)
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)
@@ -182,17 +182,20 @@ def main():
                 texts = batch['text']  # List of raw texts in the batch
 
                 batch_size_, seq_length = input_ids.size()
+                logger.info(f"batch_size_: {batch_size_}") # 2?
+                logger.info(f"seq_length: {seq_length}") # 2048?
 
                 # Extract residuals
                 with torch.no_grad():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
                     hidden_states = outputs.hidden_states
 
-                # Corrected indexing for residuals
                 residuals = hidden_states[layer_idx + 1]  # Shape: [batch_size, seq_length, hidden_size]
+                logger.info(f"residuals.shape: {residuals.shape}")
 
                 # Reshape residuals to [batch_size * seq_length, hidden_size]
                 residuals = residuals.view(batch_size_ * seq_length, -1)
+                logger.info(f"Reshaped residuals to [batch_size * seq_length, hidden_size]: residuals.shape: {residuals.shape}")
                 token_batch_size = residuals.size(0)
                 total_tokens += token_batch_size
 
@@ -214,15 +217,15 @@ def main():
                     latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, latent_dim]
                     latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Shape: [batch_size * seq_length, k]
 
-                # Validate latent_indices
-                max_latent_index = latent_indices.max().item()
-                if max_latent_index >= latent_dim:
-                    logger.error(f"latent_indices max {max_latent_index} >= latent_dim {latent_dim}")
-                    raise ValueError(f"latent_indices contain values >= latent_dim ({latent_dim})")
+                logger.info(f"latent_acts.shape: {latent_acts.shape}")
+                logger.info(f"latent_indices.shape: {latent_indices.shape}")
+                logger.info(f"latent_dim: {latent_dim}")
 
                 # Create the activation mask
                 activation_mask = torch.zeros(token_batch_size, latent_dim, dtype=torch.bool, device=device)
+                logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
+                logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
 
                 # Proper summing over the latent dimension
                 activation_counts += activation_mask.sum(dim=0).cpu().numpy()
@@ -230,7 +233,6 @@ def main():
                 # Get indices of active neurons
                 active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
 
-                logger.info(f"latent_acts.shape: {latent_acts.shape}")
                 logger.info(f"active_token_indices.shape: {active_token_indices.shape}")
                 logger.info(f"active_neuron_indices.shape: {active_neuron_indices.shape}")
                 logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
@@ -290,6 +292,8 @@ def main():
             sae_model.eval()
 
             logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
+            expansion_factor = 0
+            latent_dim = 0
 
             # Extract expansion_factor from sae_cfg
             if hasattr(sae_cfg, 'expansion_factor'):
@@ -298,6 +302,14 @@ def main():
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
+            
+            # Extract latent_dim from sae_cfg
+            if hasattr(sae_cfg, 'k'):
+                latent_dim = sae_cfg.k
+                logger.info(f"Rank {rank}: latent_dim for {layer_to_analyze}: {latent_dim}")
+            else:
+                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
+                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
 
             # Calculate adjusted latent_dim
             # Based on the provided facts:
@@ -307,12 +319,9 @@ def main():
             # This suggests that latent_dim should be adjusted to match the expansion_factor
             # Therefore, latent_dim should be set to expansion_factor (32)
 
-            latent_dim = expansion_factor  # Set latent_dim to expansion_factor=32
-            logger.info(f"Rank {rank}: Set latent_dim to expansion_factor: {latent_dim}")
-
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device, args
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, expansion_factor, device, args
             )
 
             # Accumulate total_tokens
