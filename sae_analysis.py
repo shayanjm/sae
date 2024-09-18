@@ -227,7 +227,7 @@ def main():
                 logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
                 logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
-
+                logger.info(f"Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0)}")
                 # Proper summing over the latent dimension
                 activation_counts += activation_mask.sum(dim=0).cpu().numpy()
 
