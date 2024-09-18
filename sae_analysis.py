@@ -226,6 +226,7 @@ def main():
                 activation_mask = torch.zeros(token_batch_size, latent_dim, dtype=torch.bool, device=device)
                 logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
+                logger.info(f"Max latent index: {latent_indices.max().item()}")
                 logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
                 logger.info(f"Shape of Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0).shape}")
                 # Proper summing over the latent dimension
