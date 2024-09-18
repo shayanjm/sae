@@ -7,8 +7,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import numpy as np
 import os
-import json
-import math
 from tqdm import tqdm
 from safetensors.torch import load_file
 from sae.sae import Sae, ForwardOutput, EncoderOutput
@@ -36,8 +34,6 @@ def main():
                         help='Name of the dataset to use')
     parser.add_argument('--dataset_rows', type=int, default=None,
                         help='Number of rows from the dataset to use (default: all)')
-    parser.add_argument('--activation_threshold', type=float, default=0.5,
-                        help='Activation threshold (default: 0.5)')
     parser.add_argument('--max_token_length', type=int, default=2048,
                         help='Maximum token length for tokenizer (default: 2048)')
     parser.add_argument('--context_window', type=int, default=4,
@@ -55,7 +51,7 @@ def main():
     sae_directory = args.sae_directory
 
     # Set the device for each process
-    device = torch.device('cuda', rank) if torch.cuda.is_available() else 'cpu'
+    device = torch.device('cuda', rank) if torch.cuda.is available() else 'cpu'
     logger.info(f"Rank {rank}/{world_size}, using device: {device}")
 
     # Load the tokenizer and model from arguments
@@ -289,19 +285,6 @@ def main():
         progress_bar.close()
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
- 
-
- 
-
-    # Set an activation threshold to filter significant activations
-    activation_threshold = args.activation_threshold  # Use the value from arguments
-
-    # Initialize total_tokens for the rank
-    total_tokens_rank = 0
-
-    all_activation_counts = []
-    all_neuron_activation_texts = defaultdict(list)
-    all_token_context_maps = {}
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
@@ -320,7 +303,7 @@ def main():
 
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, activation_threshold, latent_dim, device
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, device
             )
 
             # Accumulate total_tokens
