@@ -226,8 +226,8 @@ def main():
                         latent_acts = forward_output.latent_acts # Top-k latent activations
                         latent_indices = forward_output.latent_indices # Top-k latent indices
 
-                    # Create the activation mask using the top-k indices
-                    activation_mask = torch.zeros_like(residuals, dtype=torch.bool)  # Initialize a zero mask
+                    # Create the activation mask using the shape [batch_size, latent_dim]
+                    activation_mask = torch.zeros(batch_size_, latent_dim, dtype=torch.bool, device=device)  # Correct mask shape
                     activation_mask.scatter_(1, latent_indices, 1)  # Set mask at top-k indices to 1 (activated)
 
                     # Proper summing over the latent dimension
@@ -285,6 +285,7 @@ def main():
         progress_bar.close()
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
+
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
