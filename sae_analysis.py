@@ -64,10 +64,7 @@ def main():
     # Function to load an SAE
     def load_sae(layer_name):
         layer_path = os.path.join(sae_directory, layer_name)
-        
-        # Load the SAE model from disk
         sae_model = Sae.load_from_disk(layer_path, device=device)
-
         return sae_model, sae_model.cfg 
 
     # Tokenizer function using args.max_token_length
@@ -190,16 +187,16 @@ def main():
                 residuals = hidden_states[layer_idx + 1]  # Corrected indexing
 
                 # Reshape residuals to [batch_size * seq_length, hidden_size]
-                residuals = residuals.view(-1, residuals.size(-1))
-                num_tokens_in_batch = residuals.size(0)
-                total_tokens += num_tokens_in_batch
+                residuals = residuals.view(batch_size_ * seq_length, -1)
+                token_batch_size = residuals.size(0)
+                total_tokens += token_batch_size
 
                 # Flatten token IDs and move to CPU for tokenization
                 token_ids = input_ids.view(-1).cpu().numpy()  # Shape: [batch_size * seq_length]
                 tokens = tokenizer.convert_ids_to_tokens(token_ids)
 
                 # Precompute batch and sequence indices
-                indices_in_residuals = np.arange(num_tokens_in_batch)
+                indices_in_residuals = np.arange(token_batch_size)
                 batch_idx_array = indices_in_residuals // seq_length
                 seq_idx_array = indices_in_residuals % seq_length
 
@@ -210,25 +207,25 @@ def main():
                     tokens_full = tokenizer.convert_ids_to_tokens(input_ids_batch)
                     tokens_full_list.append(tokens_full)
 
-                for i in range(0, num_tokens_in_batch, token_batch_size):
+                for i in range(0, residuals.size(0), token_batch_size):
                     # Batch slicing
-                    token_batch = residuals[i:i+token_batch_size]
+                    token_batch = residuals[i:i+token_batch_size].to(device)
                     tokens_batch = tokens[i:i+token_batch_size]
                     batch_idx_array_in_batch = batch_idx_array[i:i+token_batch_size]
                     seq_idx_array_in_batch = seq_idx_array[i:i+token_batch_size]
 
-                    # Move token_batch to device
-                    token_batch = token_batch.to(device)
-
+                    # Compute forward pass through SAE model
                     with torch.no_grad():
-                        forward_output = sae_model(token_batch)  # Now returns ForwardOutput
-                        sae_out = forward_output.sae_out         # SAE output
-                        latent_acts = forward_output.latent_acts # Top-k latent activations
-                        latent_indices = forward_output.latent_indices # Top-k latent indices
+                        forward_output = sae_model(token_batch)
+                        sae_out = forward_output.sae_out
+                        latent_acts = forward_output.latent_acts
+                        latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Adjust latent_indices shape
 
-                    # Create the activation mask using the shape [batch_size, latent_dim]
-                    activation_mask = torch.zeros(batch_size_, latent_dim, dtype=torch.bool, device=device)  # Correct mask shape
-                    activation_mask.scatter_(1, latent_indices, 1)  # Set mask at top-k indices to 1 (activated)
+                    # Create the activation mask
+                    activation_mask = torch.zeros(token_batch_size, latent_dim, dtype=torch.bool, device=device)
+
+                    # Scatter top-k indices into the mask
+                    activation_mask.scatter_(1, latent_indices, 1)
 
                     # Proper summing over the latent dimension
                     activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Summing across latents only
@@ -285,7 +282,6 @@ def main():
         progress_bar.close()
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
-
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
