@@ -154,7 +154,8 @@ def main():
 
     # Function to process data loader
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, activation_threshold, latent_dim, device, token_batch_size=2048):
-        activation_counts = np.zeros(latent_dim)  # Adjusted to the number of latents (192 in this case)
+        # Initialize activation counts with the shape of the latent dimensions (192 in this case)
+        activation_counts = np.zeros(latent_dim)  # Corrected to latent dimension (192)
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)  # Using defaultdict for efficiency
 
@@ -232,7 +233,7 @@ def main():
                     # Compute activation mask on GPU
                     activation_mask = (latent_acts != 0) & (latent_acts >= activation_threshold)
 
-                    # Update activation counts (using latent dimension, not token dimension)
+                    # Correctly sum over the latent dimension
                     activation_counts += activation_mask.sum(dim=0).cpu().numpy()  # Correct latent dim shape
 
                     # Get indices of active neurons and tokens
@@ -287,6 +288,7 @@ def main():
         progress_bar.close()
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
+
  
 
     # Set an activation threshold to filter significant activations
