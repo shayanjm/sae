@@ -254,7 +254,7 @@ def main():
                 for idx in range(len(active_token_indices)):
                     token_index_in_batch = active_token_indices[idx]
                     neuron_idx = active_neuron_indices[idx]
-                    activation_value = activation_values[idx]
+                    activation_value = activation_values[token_index_in_batch, neuron_idx]
                     token = tokens[token_index_in_batch]
 
                     batch_idx = token_index_in_batch // seq_length
