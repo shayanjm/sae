@@ -154,6 +154,7 @@ def main():
     # Function to process data loader
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, d_in, expansion_factor, device, args):
         activation_counts = np.zeros(d_in * expansion_factor)
+        logger.info(f"activation_counts.shape: {activation_counts.shape}")
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)
         token_context_map = {}
