@@ -155,7 +155,6 @@ def main():
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
-        logger.info(f"activation_counts.shape: {activation_counts.shape}")
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)
         token_context_map = {}
@@ -184,8 +183,6 @@ def main():
                 texts = batch['text']  # List of raw texts in the batch
 
                 batch_size_, seq_length = input_ids.size()
-                logger.info(f"batch_size_: {batch_size_}") # 2?
-                logger.info(f"seq_length: {seq_length}") # 2048?
 
                 # Extract residuals
                 with torch.no_grad():
@@ -193,18 +190,15 @@ def main():
                     hidden_states = outputs.hidden_states
 
                 residuals = hidden_states[layer_idx + 1]  # Shape: [batch_size, seq_length, hidden_size]
-                logger.info(f"residuals.shape: {residuals.shape}")
 
                 # Reshape residuals to [batch_size * seq_length, hidden_size]
                 residuals = residuals.view(batch_size_ * seq_length, -1)
-                logger.info(f"Reshaped residuals to [batch_size * seq_length, hidden_size]: residuals.shape: {residuals.shape}")
                 token_batch_size = residuals.size(0)
                 total_tokens += token_batch_size
 
                 # Flatten token IDs and move to CPU for tokenization
                 token_ids = input_ids.view(-1).cpu().numpy()  # Shape: [batch_size * seq_length]
                 tokens = tokenizer.convert_ids_to_tokens(token_ids)
-                logger.info(f"len(tokens): {len(tokens)}")
                 torch.save(tokens, f'{layer_to_analyze}_tokens.pt')
 
                 # Precompute full token sequences for each example in the batch
@@ -221,34 +215,19 @@ def main():
                     latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, k]
                     latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Shape: [batch_size * seq_length, k]
 
-                logger.info(f"latent_acts.shape: {latent_acts.shape}")
-                logger.info(f"latent_indices.shape: {latent_indices.shape}")
-                logger.info(f"k: {k}")
-
                 torch.save(latent_acts, f'{layer_to_analyze}_latent_acts.pt')
                 torch.save(latent_indices, f'{layer_to_analyze}_latent_indices.pt')
                 torch.save(sae_out, f'{layer_to_analyze}_sae_out.pt')
 
-
                 # Create the activation mask
                 activation_mask = torch.zeros(token_batch_size, num_latents, dtype=torch.bool, device=device)
                 activation_values = torch.zeros(token_batch_size, num_latents, dtype=torch.float32, device=device)
-                logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
                 activation_values.scatter_(1, latent_indices, latent_acts)
-                logger.info(f"Max latent index: {latent_indices}")
-                logger.info(f"Max latent activation value: {activation_values.max()}")
-                logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
-                logger.info(f"Shape of Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0).shape}")
-                # Proper summing over the latent dimension
                 activation_counts += activation_mask.sum(dim=0)
 
                 # Get indices of active neurons
                 active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
-
-                logger.info(f"active_token_indices.shape: {active_token_indices.shape}")
-                logger.info(f"active_neuron_indices.shape: {active_neuron_indices.shape}")
-                logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
 
                 # Process activations
                 for idx in range(len(active_token_indices)):
