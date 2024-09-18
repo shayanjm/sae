@@ -224,7 +224,12 @@ def main():
                 logger.info(f"latent_acts.shape: {latent_acts.shape}")
                 logger.info(f"latent_indices.shape: {latent_indices.shape}")
                 logger.info(f"k: {k}")
-                
+
+                torch.save(latent_acts, f'{layer_to_analyze}_latent_acts.pt')
+                torch.save(latent_indices, f'{layer_to_analyze}_latent_indices.pt')
+                torch.save(sae_out, f'{layer_to_analyze}_sae_out.pt')
+
+
                 # Create the activation mask
                 activation_mask = torch.zeros(token_batch_size, num_latents, dtype=torch.bool, device=device)
                 logger.info(f"activation_mask.shape: {activation_mask.shape}")
