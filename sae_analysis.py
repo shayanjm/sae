@@ -153,7 +153,7 @@ def main():
 
     # Function to process data loader
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, d_in, expansion_factor, device, args):
-        activation_counts = np.zeros(d_in)
+        activation_counts = torch.zeros(latent_dim, dtype=torch.int32, device=device)
         logger.info(f"activation_counts.shape: {activation_counts.shape}")
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)
@@ -227,7 +227,7 @@ def main():
                 logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
                 logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
-                logger.info(f"Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0)}")
+                logger.info(f"Shape of Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0).shape}")
                 # Proper summing over the latent dimension
                 activation_counts += activation_mask.sum(dim=0).cpu().numpy()
 
