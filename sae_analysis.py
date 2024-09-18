@@ -231,7 +231,7 @@ def main():
                 logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
                 logger.info(f"Shape of Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0).shape}")
                 # Proper summing over the latent dimension
-                activation_counts += activation_mask.sum(dim=0).cpu()
+                activation_counts += activation_mask.sum(dim=0)
 
                 # Get indices of active neurons
                 active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
