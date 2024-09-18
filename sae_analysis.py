@@ -241,11 +241,11 @@ def main():
                 logger.info(f"Max token index: {active_token_indices.max()}, Max neuron index: {active_neuron_indices.max()}")
 
                 # Extract activation values safely
-                activation_values = latent_acts[active_token_indices, active_neuron_indices].cpu().numpy()
+                activation_values = latent_acts[active_token_indices, active_neuron_indices]
 
                 # Move indices to CPU for further processing
-                active_token_indices = active_token_indices.cpu().numpy()
-                active_neuron_indices = active_neuron_indices.cpu().numpy()
+                active_token_indices = active_token_indices
+                active_neuron_indices = active_neuron_indices
 
                 # Process activations
                 for idx in range(len(active_token_indices)):
