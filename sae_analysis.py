@@ -152,8 +152,9 @@ def main():
     all_token_context_maps = {}
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, d_in, expansion_factor, device, args):
-        activation_counts = torch.zeros(latent_dim, dtype=torch.int32, device=device)
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args):
+        num_latents = d_in * expansion_factor
+        activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
         logger.info(f"activation_counts.shape: {activation_counts.shape}")
         total_tokens = 0
         neuron_activation_texts = defaultdict(list)
@@ -215,25 +216,22 @@ def main():
                 with torch.no_grad():
                     forward_output = sae_model(residuals)
                     sae_out = forward_output.sae_out
-                    latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, latent_dim]
+                    latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, k]
                     latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Shape: [batch_size * seq_length, k]
 
                 logger.info(f"latent_acts.shape: {latent_acts.shape}")
                 logger.info(f"latent_indices.shape: {latent_indices.shape}")
-                logger.info(f"latent_dim: {latent_dim}")
+                logger.info(f"k: {k}")
                 
-                torch.save(latent_acts, f'{layer_to_analyze}_latent_acts.pt')
-                torch.save(latent_indices, f'{layer_to_analyze}_latent_indices.pt')
-                torch.save(sae_out, f'{layer_to_analyze}_sae_out.pt')
                 # Create the activation mask
-                activation_mask = torch.zeros(token_batch_size, latent_dim, dtype=torch.bool, device=device)
+                activation_mask = torch.zeros(token_batch_size, num_latents, dtype=torch.bool, device=device)
                 logger.info(f"activation_mask.shape: {activation_mask.shape}")
                 activation_mask.scatter_(1, latent_indices, 1)
                 logger.info(f"Max latent index: {latent_indices}")
                 logger.info(f"Scattered activation_mask.shape: {activation_mask.shape}")
                 logger.info(f"Shape of Sum on dimension 0 of activation_mask: {activation_mask.sum(dim=0).shape}")
                 # Proper summing over the latent dimension
-                activation_counts += activation_mask.sum(dim=0).cpu().numpy()
+                activation_counts += activation_mask.sum(dim=0).cpu()
 
                 # Get indices of active neurons
                 active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
@@ -298,7 +296,7 @@ def main():
 
             logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
             expansion_factor = 0
-            latent_dim = 0
+            k = 0
 
             # Extract expansion_factor from sae_cfg
             if hasattr(sae_cfg, 'expansion_factor'):
@@ -308,10 +306,10 @@ def main():
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
             
-            # Extract latent_dim from sae_cfg
+            # Extract k from sae_cfg
             if hasattr(sae_cfg, 'k'):
-                latent_dim = sae_cfg.k
-                logger.info(f"Rank {rank}: latent_dim for {layer_to_analyze}: {latent_dim}")
+                k = sae_cfg.k
+                logger.info(f"Rank {rank}: k for {layer_to_analyze}: {k}")
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
@@ -327,7 +325,7 @@ def main():
 
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, latent_dim, d_in, expansion_factor, device, args
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args
             )
 
             # Accumulate total_tokens
