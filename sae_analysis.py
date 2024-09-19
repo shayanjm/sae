@@ -443,19 +443,29 @@ def main():
 
         # Read all Parquet files and combine them
         combined_tables = []
-        for file in all_files:
+        logger.info("Rank 0: Reading Parquet files from all ranks.")
+        for file in tqdm(all_files, desc="Aggregating Parquet files", ncols=80):
             table = pq.read_table(file)
             combined_tables.append(table)
 
         if combined_tables:
             # Concatenate all tables
+            logger.info("Rank 0: Concatenating tables.")
             final_table = pa.concat_tables(combined_tables, promote=True)
 
-            # Save the combined table
+            # Save the combined table with a progress bar
+            logger.info("Rank 0: Writing combined Parquet file.")
             final_output_dir = os.path.join(args.output_directory, "combined")
             os.makedirs(final_output_dir, exist_ok=True)
             final_output_file = os.path.join(final_output_dir, "all_layers.parquet")
-            pq.write_table(final_table, final_output_file, compression="snappy")
+
+            # Since pq.write_table doesn't support progress, we can simulate progress
+            # Simulate progress bar for writing (assuming it takes time)
+            with tqdm(
+                total=1, desc="Writing combined Parquet file", ncols=80
+            ) as write_pbar:
+                pq.write_table(final_table, final_output_file, compression="snappy")
+                write_pbar.update(1)
 
             logger.info(f"Rank {rank}: Aggregated results saved to {final_output_file}")
         else:
