@@ -11,6 +11,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import logging
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm  # Import tqdm
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -144,7 +145,9 @@ def main():
     logger.info(f"Rank {rank}: DataLoader length: {len(data_loader)}")
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device):
+    def process_data_loader(
+        data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device, args, tokenizer, rank
+    ):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int64, device=device)
         total_tokens = 0
@@ -153,6 +156,7 @@ def main():
 
         # Initialize lists to store results
         activations_list = []
+        latent_indices_list = []
         reconstruction_errors_list = []
         trigger_tokens_list = []
         contexts_list = []
@@ -162,18 +166,32 @@ def main():
         # Start processing
         logger.info(f"Rank {rank}: Starting data loader processing for {layer_to_analyze}")
 
-        for batch_idx, batch in enumerate(data_loader):
+        # Create tqdm progress bar
+        data_loader_length = len(data_loader)
+        progress_bar = tqdm(
+            data_loader,
+            desc=f"Rank {rank}, Layer {layer_to_analyze}",
+            position=rank,
+            leave=True,
+            total=data_loader_length,
+            ncols=80
+        )
+
+        for batch_idx, batch in enumerate(progress_bar):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             texts = batch['text']
 
             # Forward pass through the model
             with torch.no_grad():
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True
+                )
                 hidden_states = outputs.hidden_states  # Tuple of hidden states at each layer
 
             # Get the residuals (activations) at the specified layer
-            # Assuming residuals are the hidden states at the layer
             residuals = hidden_states[layer_idx]  # Shape: [batch_size, seq_length, hidden_size]
 
             # Flatten batch and sequence dimensions
@@ -181,12 +199,12 @@ def main():
             residuals_flat = residuals.view(-1, hidden_size)  # Shape: [batch_size * seq_length, hidden_size]
 
             # Pass through SAE to get encoded representations and reconstruction errors
-            encoded = sae_model.encoder(residuals_flat)
-            decoded = sae_model.decoder(encoded)
+            encoder_output = sae_model.encode(residuals_flat)
+            decoded = sae_model.decode(encoder_output.top_acts, encoder_output.top_indices)
             reconstruction_errors = torch.mean((residuals_flat - decoded) ** 2, dim=1)  # Shape: [total_tokens]
 
             # Collect activation counts (if needed)
-            activation_counts += torch.sum(encoded > 0, dim=0).to(torch.int64)
+            activation_counts += torch.sum(encoder_output.top_acts > 0, dim=0).to(torch.int64)
 
             # Total tokens processed
             total_tokens += residuals_flat.size(0)
@@ -201,8 +219,9 @@ def main():
                 for j in range(seq_length):
                     idx_in_batch = i * seq_length + j
 
-                    # Get activation, reconstruction error, token, context, position
-                    activation = encoded[idx_in_batch].detach().cpu()
+                    # Get activation, latent indices, reconstruction error, token, context, position
+                    activation = encoder_output.top_acts[idx_in_batch].detach().cpu().numpy()
+                    latent_indices = encoder_output.top_indices[idx_in_batch].detach().cpu().numpy()
                     reconstruction_error = reconstruction_errors[idx_in_batch].item()
                     trigger_token = tokens[j]
                     token_position = j
@@ -213,21 +232,26 @@ def main():
                     context_tokens = tokens[start:end]
 
                     # Append to lists
-                    activations_list.append(activation.numpy())
+                    activations_list.append(activation)
+                    latent_indices_list.append(latent_indices)
                     reconstruction_errors_list.append(reconstruction_error)
                     trigger_tokens_list.append(trigger_token)
                     contexts_list.append(context_tokens)
                     token_positions_list.append(token_position)
                     sample_ids_list.append(batch_idx * batch_size + i)
 
-            if batch_idx % 10 == 0:
-                logger.info(f"Rank {rank}: Processed batch {batch_idx}")
+            # Update progress bar
+            progress_bar.set_postfix(batch=batch_idx)
+
+        # Close the progress bar
+        progress_bar.close()
 
         # Create a dictionary to store the results
         data = {
             'layer_index': [layer_idx] * len(activations_list),
             'sample_id': sample_ids_list,
             'activation': activations_list,
+            'latent_indices': latent_indices_list,
             'reconstruction_error': reconstruction_errors_list,
             'trigger_token': trigger_tokens_list,
             'context': contexts_list,
@@ -262,7 +286,7 @@ def main():
 
             # Call the processing function
             data = process_data_loader(
-                data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device
+                data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device, args, tokenizer, rank
             )
 
             # Save the results to a Parquet file
@@ -275,6 +299,7 @@ def main():
                 'layer_index': pa.array(data['layer_index'], type=pa.int32()),
                 'sample_id': pa.array(data['sample_id'], type=pa.int32()),
                 'activation': pa.array(data['activation'], type=pa.list_(pa.float32())),
+                'latent_indices': pa.array(data['latent_indices'], type=pa.list_(pa.int32())),
                 'reconstruction_error': pa.array(data['reconstruction_error'], type=pa.float32()),
                 'trigger_token': pa.array(data['trigger_token'], type=pa.string()),
                 'context': pa.array(data['context'], type=pa.list_(pa.string())),
