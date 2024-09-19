@@ -85,6 +85,7 @@ def main():
     # Load the tokenizer and model from arguments
     model_name = args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
     model.to(device)
     model.eval()  # Set to evaluation mode
@@ -97,7 +98,6 @@ def main():
 
     # Tokenizer function using args.max_token_length
     def tokenize_function(examples):
-        tokenizer.pad_token = tokenizer.eos_token
         tokenized = tokenizer(
             examples['text'],
             truncation=True,
