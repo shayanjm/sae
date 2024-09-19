@@ -1,20 +1,16 @@
 import torch
 import torch.distributed as dist
-from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-import numpy as np
 import os
-from tqdm import tqdm
-from sae.sae import Sae, ForwardOutput, EncoderOutput
+from sae.sae import Sae
 import argparse
 from torch.distributed.elastic.multiprocessing.errors import record
 import logging
-import pandas as pd
-from collections import defaultdict
-import wandb  # Import wandb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,8 +36,6 @@ def main():
                         help='Number of tokens around the activating token to include as context (default: 4)')
     parser.add_argument('--batch_size', type=int, default=2,
                         help='Batch size for DataLoader (default: 2)')
-    parser.add_argument('--run_name', type=str, default=None,
-                        help='Optional run name for wandb logging')
     args = parser.parse_args()
 
     # Initialize the process group for distributed training
@@ -56,32 +50,10 @@ def main():
     device = torch.device('cuda', local_rank) if torch.cuda.is_available() else 'cpu'
     logger.info(f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}")
 
-    # Initialize wandb only on rank 0
-    if rank == 0:
-        if args.run_name:
-            run_name = args.run_name
-        else:
-            run_name = None  # Let wandb generate a run name
-
-        wandb.init(
-            name=run_name,
-            project="sae-analysis",
-            config=vars(args),
-            save_code=True,
-        )
-        logger.info(f"Rank {rank}: wandb run initialized.")
-
     # Load the tokenizer and model from arguments
     model_name = args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = '</s>'
-        tokenizer.pad_token_id = 2  # For LLaMA models
-
-    if tokenizer.eos_token_id is None:
-        tokenizer.eos_token = '</s>'
-        tokenizer.eos_token_id = 2
 
     model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
     model.to(device)
@@ -102,7 +74,8 @@ def main():
             examples['text'],
             truncation=True,
             padding='max_length',
-            max_length=args.max_token_length
+            max_length=args.max_token_length,
+            return_tensors='pt'
         )
         tokenized['text'] = examples['text']  # Retain the 'text' field
         return tokenized
@@ -147,9 +120,8 @@ def main():
 
     # Define custom Dataset class
     class TokenizedDataset(Dataset):
-        def __init__(self, tokenized_data, include_text=False):
+        def __init__(self, tokenized_data):
             self.tokenized_data = tokenized_data
-            self.include_text = include_text
 
         def __len__(self):
             return len(self.tokenized_data)
@@ -157,82 +129,112 @@ def main():
         def __getitem__(self, idx):
             data_point = self.tokenized_data[idx]
             item = {key: torch.tensor(data_point[key]) for key in ['input_ids', 'attention_mask'] if key in data_point}
-            if self.include_text:
-                item['text'] = data_point['text']  # Include raw text
+            item['text'] = data_point['text']
             return item
 
-    # Create PyTorch dataset with text included
-    torch_dataset = TokenizedDataset(tokenized_dataset, include_text=True)
+    # Create PyTorch dataset
+    torch_dataset = TokenizedDataset(tokenized_dataset)
 
     # Create DistributedSampler and DataLoader
-    sampler = DistributedSampler(torch_dataset, num_replicas=world_size, rank=rank, drop_last=True, shuffle=False)
-    sampler.set_epoch(0)
-    batch_size = args.batch_size  # Use batch_size from arguments
-    data_loader = DataLoader(torch_dataset, batch_size=batch_size, sampler=sampler)
+    sampler = DistributedSampler(torch_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    batch_size = args.batch_size
+    data_loader = DataLoader(torch_dataset, batch_size=batch_size, sampler=sampler, shuffle=False, drop_last=True)
 
     # Log DataLoader length
     logger.info(f"Rank {rank}: DataLoader length: {len(data_loader)}")
 
-    # Initialize variables to accumulate results
-    total_tokens_rank = 0
-    all_activation_counts = []
-    all_neuron_activation_texts = defaultdict(list)
-    all_token_context_maps = {}
-
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args):
+    def process_data_loader(data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int64, device=device)
         total_tokens = 0
 
         layer_idx = int(layer_to_analyze.split('.')[-1])
 
-        # Progress bar
-        data_loader_length = len(data_loader)
-        logger.info(f"Rank {rank}: Starting data loader processing. DataLoader length: {data_loader_length}")
-        progress_bar = tqdm(enumerate(data_loader), total=data_loader_length, desc=f"Rank {rank} Processing {layer_to_analyze}", position=rank, leave=False)
+        # Initialize lists to store results
+        activations_list = []
+        reconstruction_errors_list = []
+        trigger_tokens_list = []
+        contexts_list = []
+        token_positions_list = []
+        sample_ids_list = []
 
-        for batch_idx_in_loader, batch in progress_bar:
-            try:
-                # Move batch to device
-                input_ids = batch['input_ids'].to(device)           # Shape: [batch_size, seq_length]
-                attention_mask = batch['attention_mask'].to(device) # Shape: [batch_size, seq_length]
-                texts = batch['text']
+        # Start processing
+        logger.info(f"Rank {rank}: Starting data loader processing for {layer_to_analyze}")
 
-                batch_size_, seq_length = input_ids.size()
+        for batch_idx, batch in enumerate(data_loader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            texts = batch['text']
 
-                # Extract residuals using mixed precision for faster computation
-                with autocast():
-                    with torch.no_grad():
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                        hidden_states = outputs.hidden_states
+            # Forward pass through the model
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                hidden_states = outputs.hidden_states  # Tuple of hidden states at each layer
 
-                residuals = hidden_states[layer_idx + 1].view(batch_size_ * seq_length, -1)  # Shape: [batch_size * seq_length, hidden_dim]
+            # Get the residuals (activations) at the specified layer
+            # Assuming residuals are the hidden states at the layer
+            residuals = hidden_states[layer_idx]  # Shape: [batch_size, seq_length, hidden_size]
 
-                total_tokens += residuals.size(0)
+            # Flatten batch and sequence dimensions
+            batch_size, seq_length, hidden_size = residuals.size()
+            residuals_flat = residuals.view(-1, hidden_size)  # Shape: [batch_size * seq_length, hidden_size]
 
-                # Get latent activations and indices
-                forward_output = sae_model(residuals)
-                sae_out = forward_output.sae_out
-                latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, num_latents]
-                latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)  # Shape: [batch_size * seq_length, num_latents]
+            # Pass through SAE to get encoded representations and reconstruction errors
+            encoded = sae_model.encoder(residuals_flat)
+            decoded = sae_model.decoder(encoded)
+            reconstruction_errors = torch.mean((residuals_flat - decoded) ** 2, dim=1)  # Shape: [total_tokens]
 
-                # Activation mask and values using scatter in one shot
-                activation_mask = torch.zeros(residuals.size(0), num_latents, dtype=torch.bool, device=device)
-                activation_values = torch.zeros(residuals.size(0), num_latents, dtype=torch.float32, device=device)
-                activation_mask.scatter_(1, latent_indices, 1)
-                activation_values.scatter_(1, latent_indices, latent_acts)
-                activation_counts += activation_mask.sum(dim=0).to(torch.int64)
+            # Collect activation counts (if needed)
+            activation_counts += torch.sum(encoded > 0, dim=0).to(torch.int64)
 
-                progress_bar.set_postfix({'Total Tokens': total_tokens})
+            # Total tokens processed
+            total_tokens += residuals_flat.size(0)
 
-            except Exception as e:
-                logger.error(f"Rank {rank}: Error in batch {batch_idx_in_loader}: {e}")
-                raise
+            # Prepare context and token data
+            for i in range(batch_size):
+                text = texts[i]
+                input_id_sequence = input_ids[i]
+                tokens = tokenizer.convert_ids_to_tokens(input_id_sequence)
+                text_length = len(tokens)
 
-        progress_bar.close()
+                for j in range(seq_length):
+                    idx_in_batch = i * seq_length + j
 
-        return activation_counts, total_tokens
+                    # Get activation, reconstruction error, token, context, position
+                    activation = encoded[idx_in_batch].detach().cpu()
+                    reconstruction_error = reconstruction_errors[idx_in_batch].item()
+                    trigger_token = tokens[j]
+                    token_position = j
+
+                    # Get context window
+                    start = max(0, j - args.context_window)
+                    end = min(text_length, j + args.context_window + 1)
+                    context_tokens = tokens[start:end]
+
+                    # Append to lists
+                    activations_list.append(activation.numpy())
+                    reconstruction_errors_list.append(reconstruction_error)
+                    trigger_tokens_list.append(trigger_token)
+                    contexts_list.append(context_tokens)
+                    token_positions_list.append(token_position)
+                    sample_ids_list.append(batch_idx * batch_size + i)
+
+            if batch_idx % 10 == 0:
+                logger.info(f"Rank {rank}: Processed batch {batch_idx}")
+
+        # Create a dictionary to store the results
+        data = {
+            'layer_index': [layer_idx] * len(activations_list),
+            'sample_id': sample_ids_list,
+            'activation': activations_list,
+            'reconstruction_error': reconstruction_errors_list,
+            'trigger_token': trigger_tokens_list,
+            'context': contexts_list,
+            'token_position': token_positions_list
+        }
+
+        return data
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
@@ -245,50 +247,44 @@ def main():
             sae_model.eval()
 
             logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
-            expansion_factor = 0
-            k = 0
 
             # Extract expansion_factor from sae_cfg
-            if hasattr(sae_cfg, 'expansion_factor'):
-                expansion_factor = sae_cfg.expansion_factor
-            else:
+            expansion_factor = getattr(sae_cfg, 'expansion_factor', None)
+            if expansion_factor is None:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
-                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
-
-            # Extract k from sae_cfg
-            if hasattr(sae_cfg, 'k'):
-                k = sae_cfg.k
-            else:
-                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
-                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
+                raise AttributeError(f"SAE config for {layer_to_analyze} lacks 'expansion_factor'")
 
             # Extract d_in from sae_model
-            if hasattr(sae_model, 'd_in'):
-                d_in = sae_model.d_in
-            else:
+            d_in = getattr(sae_model, 'd_in', None)
+            if d_in is None:
                 logger.error(f"Rank {rank}: SAE model for {layer_to_analyze} lacks 'd_in'")
-                raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
+                raise AttributeError(f"SAE model for {layer_to_analyze} lacks 'd_in'")
 
             # Call the processing function
-            activation_counts_local, total_tokens_local = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args
+            data = process_data_loader(
+                data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device
             )
 
-            # Accumulate total_tokens
-            total_tokens_rank += total_tokens_local
+            # Save the results to a Parquet file
+            output_dir = os.path.join(args.output_directory, f"rank_{rank}")
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, f"{layer_to_analyze}.parquet")
 
-            # Aggregate activation counts across all ranks
-            activation_counts_global = activation_counts_local.clone()
-            dist.all_reduce(activation_counts_global, op=dist.ReduceOp.SUM)
+            # Convert data to PyArrow Table
+            table = pa.Table.from_pydict({
+                'layer_index': pa.array(data['layer_index'], type=pa.int32()),
+                'sample_id': pa.array(data['sample_id'], type=pa.int32()),
+                'activation': pa.array(data['activation'], type=pa.list_(pa.float32())),
+                'reconstruction_error': pa.array(data['reconstruction_error'], type=pa.float32()),
+                'trigger_token': pa.array(data['trigger_token'], type=pa.string()),
+                'context': pa.array(data['context'], type=pa.list_(pa.string())),
+                'token_position': pa.array(data['token_position'], type=pa.int32())
+            })
 
-            if rank == 0:
-                # Log aggregated data to wandb
-                wandb.log({
-                    f"Total_Tokens_{layer_to_analyze}": total_tokens_rank,
-                    f"Activation_Counts_{layer_to_analyze}": wandb.Histogram(activation_counts_global.cpu().numpy())
-                })
+            # Write the table to a Parquet file with compression
+            pq.write_table(table, output_file, compression='snappy')
 
-            logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}.")
+            logger.info(f"Rank {rank}: Saved results to {output_file}")
 
         except Exception as e:
             logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
@@ -299,25 +295,41 @@ def main():
     # Synchronize before final aggregation
     dist.barrier()
 
-    # Aggregate total_tokens across all ranks
-    total_tokens_tensor = torch.tensor([total_tokens_rank], device=device)
-    dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
-    total_tokens_global = total_tokens_tensor.item()
-
+    # Aggregate across ranks and save as needed here
     if rank == 0:
-        logger.info(f"Total tokens processed across all ranks: {total_tokens_global}")
-        # Save total_tokens_global to a file
-        output_dir = args.output_directory
-        os.makedirs(output_dir, exist_ok=True)
-        output_file_global_tokens = os.path.join(output_dir, 'total_tokens_global.txt')
-        with open(output_file_global_tokens, 'w') as f:
-            f.write(str(total_tokens_global))
-        wandb.log({"Total_Tokens_Global": total_tokens_global})
+        logger.info("Rank 0: Starting aggregation of results.")
+
+        # Collect Parquet files from all ranks
+        all_files = []
+        for r in range(world_size):
+            rank_output_dir = os.path.join(args.output_directory, f"rank_{r}")
+            if os.path.exists(rank_output_dir):
+                for fname in os.listdir(rank_output_dir):
+                    if fname.endswith('.parquet'):
+                        all_files.append(os.path.join(rank_output_dir, fname))
+
+        # Read all Parquet files and combine them
+        combined_tables = []
+        for file in all_files:
+            table = pq.read_table(file)
+            combined_tables.append(table)
+
+        if combined_tables:
+            # Concatenate all tables
+            final_table = pa.concat_tables(combined_tables, promote=True)
+
+            # Save the combined table
+            final_output_dir = os.path.join(args.output_directory, "combined")
+            os.makedirs(final_output_dir, exist_ok=True)
+            final_output_file = os.path.join(final_output_dir, "all_layers.parquet")
+            pq.write_table(final_table, final_output_file, compression='snappy')
+
+            logger.info(f"Rank {rank}: Aggregated results saved to {final_output_file}")
+        else:
+            logger.info("Rank 0: No data to aggregate.")
 
     # Clean up
     dist.destroy_process_group()
-    if rank == 0:
-        wandb.finish()  # Close the wandb run
 
 if __name__ == '__main__':
     main()
