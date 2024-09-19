@@ -14,8 +14,8 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import logging
 import pandas as pd
 from collections import defaultdict
-from torch.utils.tensorboard import SummaryWriter  # Import SummaryWriter
-import torch.profiler  # Import torch.profiler
+from torch.utils.tensorboard import SummaryWriter
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -62,10 +62,10 @@ def main():
     logger.info(f"Rank {rank}: TensorBoard logs will be saved to {log_dir}")
 
     # Initialize PyTorch Profiler with an adjusted schedule
-    profiler = torch.profiler.profile(
+    profiler = profile(
         activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA
         ],
         schedule=torch.profiler.schedule(
             wait=1,      # Steps to wait before starting to profile
@@ -93,7 +93,7 @@ def main():
     def load_sae(layer_name):
         layer_path = os.path.join(sae_directory, layer_name)
         sae_model = Sae.load_from_disk(layer_path, device=device)
-        return sae_model, sae_model.cfg 
+        return sae_model, sae_model.cfg
 
     # Tokenizer function using args.max_token_length
     def tokenize_function(examples):
@@ -200,7 +200,7 @@ def main():
             try:
                 profiler.step()  # Mark a step for the profiler
 
-                with profiler.record_function("DataLoading"):
+                with record_function("DataLoading"):  # Corrected usage
                     # Move batch to device
                     input_ids = batch['input_ids'].to(device)           # Shape: [batch_size, seq_length]
                     attention_mask = batch['attention_mask'].to(device) # Shape: [batch_size, seq_length]
@@ -208,7 +208,7 @@ def main():
 
                 batch_size_, seq_length = input_ids.size()
 
-                with profiler.record_function("ModelForward"):
+                with record_function("ModelForward"):  # Corrected usage
                     # Extract residuals using mixed precision for faster computation
                     with autocast():
                         with torch.no_grad():
@@ -219,14 +219,14 @@ def main():
 
                 total_tokens += residuals.size(0)
 
-                with profiler.record_function("SAEForward"):
+                with record_function("SAEForward"):  # Corrected usage
                     # Get latent activations and indices
                     forward_output = sae_model(residuals)
                     sae_out = forward_output.sae_out
                     latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, num_latents]
                     latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)  # Shape: [batch_size * seq_length, num_latents]
 
-                with profiler.record_function("ActivationProcessing"):
+                with record_function("ActivationProcessing"):  # Corrected usage
                     # Activation mask and values using scatter in one shot
                     activation_mask = torch.zeros(residuals.size(0), num_latents, dtype=torch.bool, device=device)
                     activation_values = torch.zeros(residuals.size(0), num_latents, dtype=torch.float32, device=device)
@@ -335,14 +335,14 @@ def main():
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
-            
+
             # Extract k from sae_cfg
             if hasattr(sae_cfg, 'k'):
                 k = sae_cfg.k
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
-            
+
             # Extract d_in from sae_model
             if hasattr(sae_model, 'd_in'):
                 d_in = sae_model.d_in
