@@ -14,8 +14,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import logging
 import pandas as pd
 from collections import defaultdict
-from torch.utils.tensorboard import SummaryWriter
-from torch.profiler import profile, record_function, ProfilerActivity
+import wandb  # Import wandb
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +40,8 @@ def main():
                         help='Number of tokens around the activating token to include as context (default: 4)')
     parser.add_argument('--batch_size', type=int, default=2,
                         help='Batch size for DataLoader (default: 2)')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional run name for wandb logging')  # Added run_name argument
     args = parser.parse_args()
 
     # Initialize the process group for distributed training
@@ -55,37 +56,49 @@ def main():
     device = torch.device('cuda', rank) if torch.cuda.is_available() else 'cpu'
     logger.info(f"Rank {rank}/{world_size}, using device: {device}")
 
-    # Initialize TensorBoard SummaryWriter
-    log_dir = os.path.join(args.output_directory, 'logs', f'rank_{rank}')
-    os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=log_dir)
-    logger.info(f"Rank {rank}: TensorBoard logs will be saved to {log_dir}")
+    # Initialize wandb
+    # Rank 0 generates the run_id and run_name and broadcasts them
+    if rank == 0:
+        if args.run_name:
+            run_name = args.run_name
+        else:
+            run_name = None  # Let wandb generate a run name
+        run_id = wandb.util.generate_id()  # Generate a unique run ID
+    else:
+        run_name = None
+        run_id = None
 
-    # Initialize PyTorch Profiler with an adjusted schedule
-    profiler = profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA
-        ],
-        schedule=torch.profiler.schedule(
-            wait=1,      # Steps to wait before starting to profile
-            warmup=1,    # Warm-up steps
-            active=10,   # Increased steps to actively profile
-            repeat=2     # Repeat profiling cycles
-        ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
-        record_shapes=True,      # Enable shape recording
-        profile_memory=True,     # Enable memory profiling
-        with_stack=True          # Capture stack traces
+    # Broadcast run_name and run_id to all ranks
+    run_name_list = [run_name]
+    run_id_list = [run_id]
+    dist.broadcast_object_list(run_name_list, src=0)
+    dist.broadcast_object_list(run_id_list, src=0)
+    run_name = run_name_list[0]
+    run_id = run_id_list[0]
+
+    wandb.init(
+        project='sae-analysis',
+        name=run_name,
+        id=run_id,
+        resume='allow',
+        config=vars(args),
+        dir=args.output_directory,
+        settings=wandb.Settings(start_method='thread', console='off', _disable_stats=True)
     )
-
-    profiler.start()
-    logger.info(f"Rank {rank}: Profiler started.")
+    logger.info(f"Rank {rank}: wandb run initialized.")
 
     # Load the tokenizer and model from arguments
     model_name = args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = '</s>'
+        tokenizer.pad_token_id = 2  # For LLaMA models
+
+    if tokenizer.eos_token_id is None:
+        tokenizer.eos_token = '</s>'
+        tokenizer.eos_token_id = 2
+
     model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
     model.to(device)
     model.eval()  # Set to evaluation mode
@@ -180,7 +193,7 @@ def main():
     all_token_context_maps = {}
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler, writer):
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, wandb):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
         total_tokens = 0
@@ -198,69 +211,63 @@ def main():
 
         for batch_idx_in_loader, batch in progress_bar:
             try:
-                profiler.step()  # Mark a step for the profiler
-
-                with record_function("DataLoading"):  # Corrected usage
-                    # Move batch to device
-                    input_ids = batch['input_ids'].to(device)           # Shape: [batch_size, seq_length]
-                    attention_mask = batch['attention_mask'].to(device) # Shape: [batch_size, seq_length]
-                    texts = batch['text']
+                # Move batch to device
+                input_ids = batch['input_ids'].to(device)           # Shape: [batch_size, seq_length]
+                attention_mask = batch['attention_mask'].to(device) # Shape: [batch_size, seq_length]
+                texts = batch['text']
 
                 batch_size_, seq_length = input_ids.size()
 
-                with record_function("ModelForward"):  # Corrected usage
-                    # Extract residuals using mixed precision for faster computation
-                    with autocast():
-                        with torch.no_grad():
-                            outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                            hidden_states = outputs.hidden_states
+                # Extract residuals using mixed precision for faster computation
+                with autocast():
+                    with torch.no_grad():
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                        hidden_states = outputs.hidden_states
 
-                    residuals = hidden_states[layer_idx + 1].view(batch_size_ * seq_length, -1)  # Shape: [batch_size * seq_length, hidden_dim]
+                residuals = hidden_states[layer_idx + 1].view(batch_size_ * seq_length, -1)  # Shape: [batch_size * seq_length, hidden_dim]
 
                 total_tokens += residuals.size(0)
 
-                with record_function("SAEForward"):  # Corrected usage
-                    # Get latent activations and indices
-                    forward_output = sae_model(residuals)
-                    sae_out = forward_output.sae_out
-                    latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, num_latents]
-                    latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)  # Shape: [batch_size * seq_length, num_latents]
+                # Get latent activations and indices
+                forward_output = sae_model(residuals)
+                sae_out = forward_output.sae_out
+                latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, num_latents]
+                latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)  # Shape: [batch_size * seq_length, num_latents]
 
-                with record_function("ActivationProcessing"):  # Corrected usage
-                    # Activation mask and values using scatter in one shot
-                    activation_mask = torch.zeros(residuals.size(0), num_latents, dtype=torch.bool, device=device)
-                    activation_values = torch.zeros(residuals.size(0), num_latents, dtype=torch.float32, device=device)
-                    activation_mask.scatter_(1, latent_indices, 1)
-                    activation_values.scatter_(1, latent_indices, latent_acts)
-                    activation_counts += activation_mask.sum(dim=0)
+                # Activation mask and values using scatter in one shot
+                activation_mask = torch.zeros(residuals.size(0), num_latents, dtype=torch.bool, device=device)
+                activation_values = torch.zeros(residuals.size(0), num_latents, dtype=torch.float32, device=device)
+                activation_mask.scatter_(1, latent_indices, 1)
+                activation_values.scatter_(1, latent_indices, latent_acts)
+                activation_counts += activation_mask.sum(dim=0)
 
-                    # Find active indices
-                    active_indices = activation_mask.nonzero(as_tuple=False)  # Shape: [num_activations, 2]
-                    token_indices = active_indices[:, 0]  # Indices of tokens in residuals
-                    neuron_indices = active_indices[:, 1]  # Neuron indices
+                # Find active indices
+                active_indices = activation_mask.nonzero(as_tuple=False)  # Shape: [num_activations, 2]
+                token_indices = active_indices[:, 0]  # Indices of tokens in residuals
+                neuron_indices = active_indices[:, 1]  # Neuron indices
 
-                    # Compute batch and sequence indices
-                    batch_indices = token_indices // seq_length  # Shape: [num_activations]
-                    seq_indices = token_indices % seq_length    # Shape: [num_activations]
+                # Compute batch and sequence indices
+                batch_indices = token_indices // seq_length  # Shape: [num_activations]
+                seq_indices = token_indices % seq_length    # Shape: [num_activations]
 
-                    # Calculate start and end indices for context window
-                    start_indices = (seq_indices - args.context_window).clamp(min=0)
-                    end_indices = (seq_indices + args.context_window + 1).clamp(max=seq_length)
+                # Calculate start and end indices for context window
+                start_indices = (seq_indices - args.context_window).clamp(min=0)
+                end_indices = (seq_indices + args.context_window + 1).clamp(max=seq_length)
 
-                    max_context_length = args.context_window * 2 + 1  # Maximum number of tokens in context
+                max_context_length = args.context_window * 2 + 1  # Maximum number of tokens in context
 
-                    # Initialize tensor to hold context token IDs
-                    context_token_ids = torch.full((token_indices.size(0), max_context_length), tokenizer.pad_token_id, dtype=torch.long, device=device)
+                # Initialize tensor to hold context token IDs
+                context_token_ids = torch.full((token_indices.size(0), max_context_length), tokenizer.pad_token_id, dtype=torch.long, device=device)
 
-                    for i in range(max_context_length):
-                        # Compute relative positions
-                        relative_pos = i - args.context_window
-                        # Calculate actual positions with clamping
-                        positions = (seq_indices + relative_pos).clamp(min=0, max=seq_length - 1)
-                        # Gather token IDs
-                        context_token_ids[:, i] = input_ids[batch_indices, positions]
+                for i in range(max_context_length):
+                    # Compute relative positions
+                    relative_pos = i - args.context_window
+                    # Calculate actual positions with clamping
+                    positions = (seq_indices + relative_pos).clamp(min=0, max=seq_length - 1)
+                    # Gather token IDs
+                    context_token_ids[:, i] = input_ids[batch_indices, positions]
 
-                    activation_values_selected = activation_values[token_indices, neuron_indices]
+                activation_values_selected = activation_values[token_indices, neuron_indices]
 
                 # Collect data
                 all_neuron_indices.append(neuron_indices)
@@ -309,9 +316,11 @@ def main():
             context_key_tuple = tuple(context_key.tolist())
             token_context_map[context_key_tuple] = idx
 
-        # Log total tokens and activation counts to TensorBoard
-        writer.add_scalar(f"Rank_{rank}/Total_Tokens_{layer_to_analyze}", total_tokens, global_step=0)
-        writer.add_histogram(f"Rank_{rank}/Activation_Counts_{layer_to_analyze}", activation_counts.cpu(), global_step=0)
+        # Log total tokens and activation counts to wandb
+        wandb.log({
+            f"Total_Tokens_{layer_to_analyze}/Rank_{rank}": total_tokens,
+            f"Activation_Counts_{layer_to_analyze}/Rank_{rank}": wandb.Histogram(activation_counts.cpu().numpy())
+        })
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
 
@@ -352,7 +361,7 @@ def main():
 
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler, writer
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, wandb
             )
 
             # Accumulate total_tokens
@@ -371,8 +380,7 @@ def main():
             logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
             raise
 
-    profiler.stop()
-    logger.info(f"Rank {rank}: Profiler stopped and data saved to {log_dir}")
+    logger.info(f"Rank {rank}: All results processed.")
 
     # Save all results together at the end
     output_dir = args.output_directory
@@ -397,8 +405,7 @@ def main():
 
     # Save token context map as Parquet
     if all_token_context_maps:
-        # Convert context keys (tuples of token IDs) to strings or another suitable format
-        # Here, we'll convert them to strings for storage
+        # Convert context keys (tuples of token IDs) to strings for storage
         token_context_df = pd.DataFrame([
             {'context_key': ' '.join(map(str, k)), 'context_index': v}
             for k, v in all_token_context_maps.items()
@@ -434,7 +441,7 @@ def main():
 
     # Clean up
     dist.destroy_process_group()
-    writer.close()  # Close the SummaryWriter
+    wandb.finish()  # Close the wandb run
 
 if __name__ == '__main__':
     main()
