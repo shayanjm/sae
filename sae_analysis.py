@@ -403,12 +403,8 @@ def main():
                 {
                     "layer_index": pa.array(data["layer_index"], type=pa.int32()),
                     "sample_id": pa.array(data["sample_id"], type=pa.int32()),
-                    "activation": pa.array(
-                        data["activation"], type=pa.list_(pa.float32())
-                    ),
-                    "latent_indices": pa.array(
-                        data["latent_indices"], type=pa.list_(pa.int32())
-                    ),
+                    "latent_index": pa.array(data["latent_index"], type=pa.int32()),
+                    "activation": pa.array(data["activation"], type=pa.float32()),
                     "reconstruction_error": pa.array(
                         data["reconstruction_error"], type=pa.float32()
                     ),
