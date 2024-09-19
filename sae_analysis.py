@@ -182,12 +182,8 @@ def main():
     # Function to process data loader
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args):
         num_latents = d_in * expansion_factor
-        activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
+        activation_counts = torch.zeros(num_latents, dtype=torch.int64, device=device)
         total_tokens = 0
-
-        all_neuron_indices = []
-        all_activation_values = []
-        all_context_token_ids = []
 
         layer_idx = int(layer_to_analyze.split('.')[-1])
 
@@ -226,52 +222,9 @@ def main():
                 activation_values = torch.zeros(residuals.size(0), num_latents, dtype=torch.float32, device=device)
                 activation_mask.scatter_(1, latent_indices, 1)
                 activation_values.scatter_(1, latent_indices, latent_acts)
-                activation_counts += activation_mask.sum(dim=0)
-
-                # Find active indices
-                active_indices = activation_mask.nonzero(as_tuple=False)  # Shape: [num_activations, 2]
-                token_indices = active_indices[:, 0]  # Indices of tokens in residuals
-                neuron_indices = active_indices[:, 1]  # Neuron indices
-
-                # Compute batch and sequence indices
-                batch_indices = token_indices // seq_length  # Shape: [num_activations]
-                seq_indices = token_indices % seq_length    # Shape: [num_activations]
-
-                # Calculate start and end indices for context window
-                start_indices = (seq_indices - args.context_window).clamp(min=0)
-                end_indices = (seq_indices + args.context_window + 1).clamp(max=seq_length)
-
-                max_context_length = args.context_window * 2 + 1  # Maximum number of tokens in context
-
-                # Initialize tensor to hold context token IDs
-                context_token_ids = torch.full((token_indices.size(0), max_context_length), tokenizer.pad_token_id, dtype=torch.long, device=device)
-
-                for i in range(max_context_length):
-                    # Compute relative positions
-                    relative_pos = i - args.context_window
-                    # Calculate actual positions with clamping
-                    positions = (seq_indices + relative_pos).clamp(min=0, max=seq_length - 1)
-                    # Gather token IDs
-                    context_token_ids[:, i] = input_ids[batch_indices, positions]
-
-                activation_values_selected = activation_values[token_indices, neuron_indices]
-
-                # Collect data
-                all_neuron_indices.append(neuron_indices)
-                all_activation_values.append(activation_values_selected)
-                all_context_token_ids.append(context_token_ids)
+                activation_counts += activation_mask.sum(dim=0).to(torch.int64)
 
                 progress_bar.set_postfix({'Total Tokens': total_tokens})
-
-                # Periodically log data to wandb
-                if batch_idx_in_loader % 10 == 0:
-                    log_data = {
-                        f"Total_Tokens_{layer_to_analyze}/Rank_{rank}": total_tokens,
-                    }
-                    # Only log histograms if on rank 0
-                    if rank == 0:
-                        log_data[f"Activation_Counts_{layer_to_analyze}"] = wandb.Histogram(activation_counts.cpu().numpy())
-                    wandb.log(log_data)
 
             except Exception as e:
                 logger.error(f"Rank {rank}: Error in batch {batch_idx_in_loader}: {e}")
@@ -279,50 +232,7 @@ def main():
 
         progress_bar.close()
 
-        # Concatenate collected tensors
-        all_neuron_indices = torch.cat(all_neuron_indices)
-        all_activation_values = torch.cat(all_activation_values)
-        all_context_token_ids = torch.cat(all_context_token_ids)
-
-        # Move context_token_ids to CPU
-        all_context_token_ids_cpu = all_context_token_ids.cpu()
-
-        # Compute unique contexts and their indices
-        unique_context_keys, inverse_indices = torch.unique(all_context_token_ids_cpu, return_inverse=True, dim=0)
-
-        # Assign context indices
-        context_indices = torch.arange(unique_context_keys.size(0))
-
-        # Assign activation_context_indices
-        activation_context_indices = inverse_indices
-
-        # Move data to CPU
-        all_neuron_indices_cpu = all_neuron_indices.cpu()
-        all_activation_values_cpu = all_activation_values.cpu()
-        activation_context_indices_cpu = activation_context_indices.cpu()
-
-        # Build neuron activation texts
-        neuron_activation_texts = defaultdict(list)
-
-        for neuron_idx, activation_value, context_idx in zip(all_neuron_indices_cpu.tolist(), all_activation_values_cpu.tolist(), activation_context_indices_cpu.tolist()):
-            neuron_activation_texts[neuron_idx].append((activation_value, context_idx))
-
-        # Build token context map
-        token_context_map = {}
-        for idx, context_key in enumerate(unique_context_keys):
-            context_key_tuple = tuple(context_key.tolist())
-            token_context_map[context_key_tuple] = idx
-
-        # Log final data to wandb
-        log_data = {
-            f"Total_Tokens_{layer_to_analyze}/Rank_{rank}": total_tokens,
-        }
-        # Only log histograms if on rank 0
-        if rank == 0:
-            log_data[f"Activation_Counts_{layer_to_analyze}"] = wandb.Histogram(activation_counts.cpu().numpy())
-        wandb.log(log_data)
-
-        return activation_counts, total_tokens, neuron_activation_texts, token_context_map
+        return activation_counts, total_tokens
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
@@ -360,19 +270,23 @@ def main():
                 raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
 
             # Call the processing function
-            activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
+            activation_counts_local, total_tokens_local = process_data_loader(
                 data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args
             )
 
             # Accumulate total_tokens
-            total_tokens_rank += total_tokens
+            total_tokens_rank += total_tokens_local
 
-            # Accumulate the results
-            all_activation_counts.append(activation_counts)
-            for neuron_idx, activations in neuron_activation_texts.items():
-                all_neuron_activation_texts[neuron_idx].extend(activations)
-            for context_key, context_idx in token_context_map.items():
-                all_token_context_maps[context_key] = context_idx
+            # Aggregate activation counts across all ranks
+            activation_counts_global = activation_counts_local.clone()
+            dist.all_reduce(activation_counts_global, op=dist.ReduceOp.SUM)
+
+            if rank == 0:
+                # Log aggregated data to wandb
+                wandb.log({
+                    f"Total_Tokens_{layer_to_analyze}": total_tokens_rank,
+                    f"Activation_Counts_{layer_to_analyze}": wandb.Histogram(activation_counts_global.cpu().numpy())
+                })
 
             logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}.")
 
@@ -382,62 +296,23 @@ def main():
 
     logger.info(f"Rank {rank}: All results processed.")
 
-    # Save all results together at the end
-    output_dir = args.output_directory
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Save activation counts as memory-mapped arrays
-    if all_activation_counts:
-        np.save(os.path.join(output_dir, f'all_activation_counts_{rank}.npy'), torch.cat(all_activation_counts).cpu().numpy())
-    else:
-        logger.warning(f"Rank {rank}: No activation counts to save.")
-
-    # Save neuron activations as Parquet for fast reading
-    if all_neuron_activation_texts:
-        neuron_activation_df = pd.DataFrame([
-            {'neuron_idx': k, 'activation_value': a, 'context_index': c}
-            for k, v in all_neuron_activation_texts.items() for a, c in v
-        ])
-        output_file_texts = os.path.join(output_dir, f'neuron_activation_texts_{rank}.parquet')
-        neuron_activation_df.to_parquet(output_file_texts)
-    else:
-        logger.warning(f"Rank {rank}: No neuron activations to save.")
-
-    # Save token context map as Parquet
-    if all_token_context_maps:
-        # Convert context keys (tuples of token IDs) to strings for storage
-        token_context_df = pd.DataFrame([
-            {'context_key': ' '.join(map(str, k)), 'context_index': v}
-            for k, v in all_token_context_maps.items()
-        ])
-        output_file_context_map = os.path.join(output_dir, f'context_map_{rank}.parquet')
-        token_context_df.to_parquet(output_file_context_map)
-    else:
-        logger.warning(f"Rank {rank}: No token context maps to save.")
-
-    logger.info(f"Rank {rank}: All results saved.")
-
-    logger.info(f"Rank {rank}: Finished processing SAEs. Syncing to barrier.")
-    try:
-        dist.barrier()
-    except Exception as e:
-        logger.error(f"Rank {rank}: Error with barrier: {e}")
-        raise
-    logger.info(f"Rank {rank}: After barrier")
+    # Synchronize before final aggregation
+    dist.barrier()
 
     # Aggregate total_tokens across all ranks
     total_tokens_tensor = torch.tensor([total_tokens_rank], device=device)
-    logger.info(f"Rank {rank}: Performing all_reduce on total_tokens_tensor.")
     dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
-    logger.info(f"Rank {rank}: Completed all_reduce.")
     total_tokens_global = total_tokens_tensor.item()
 
     if rank == 0:
         logger.info(f"Total tokens processed across all ranks: {total_tokens_global}")
         # Save total_tokens_global to a file
+        output_dir = args.output_directory
+        os.makedirs(output_dir, exist_ok=True)
         output_file_global_tokens = os.path.join(output_dir, 'total_tokens_global.txt')
         with open(output_file_global_tokens, 'w') as f:
             f.write(str(total_tokens_global))
+        wandb.log({"Total_Tokens_Global": total_tokens_global})
 
     # Clean up
     dist.destroy_process_group()
