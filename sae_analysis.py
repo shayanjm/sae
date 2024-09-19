@@ -146,8 +146,8 @@ def main():
 
     # Function to process data loader
     def process_data_loader(
-        data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device, args, tokenizer, rank
-    ):
+    data_loader, model, sae_model, layer_to_analyze, d_in, expansion_factor, device, args, tokenizer, rank
+):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int64, device=device)
         total_tokens = 0
@@ -155,13 +155,14 @@ def main():
         layer_idx = int(layer_to_analyze.split('.')[-1])
 
         # Initialize lists to store results
-        activations_list = []
+        layer_indices_list = []
+        sample_ids_list = []
         latent_indices_list = []
+        activations_list = []
         reconstruction_errors_list = []
         trigger_tokens_list = []
         contexts_list = []
         token_positions_list = []
-        sample_ids_list = []
 
         # Start processing
         logger.info(f"Rank {rank}: Starting data loader processing for {layer_to_analyze}")
@@ -198,16 +199,22 @@ def main():
             batch_size, seq_length, hidden_size = residuals.size()
             residuals_flat = residuals.view(-1, hidden_size)  # Shape: [batch_size * seq_length, hidden_size]
 
-            # Pass through SAE to get encoded representations and reconstruction errors
-            encoder_output = sae_model.encode(residuals_flat)
-            decoded = sae_model.decode(encoder_output.top_acts, encoder_output.top_indices)
-            reconstruction_errors = torch.mean((residuals_flat - decoded) ** 2, dim=1)  # Shape: [total_tokens]
+            # Pass through SAE to get outputs
+            forward_output = sae_model(residuals_flat)
 
-            # Collect activation counts (if needed)
-            activation_counts += torch.sum(encoder_output.top_acts > 0, dim=0).to(torch.int64)
+            # Collect activation counts
+            latent_indices = forward_output.latent_indices  # Shape: [total_tokens, k]
+            latent_acts = forward_output.latent_acts  # Shape: [total_tokens, k]
+
+            # Flatten indices and count activations
+            indices_flat = latent_indices.view(-1)
+            activation_counts += torch.bincount(indices_flat, minlength=num_latents).to(torch.int64)
 
             # Total tokens processed
             total_tokens += residuals_flat.size(0)
+
+            # Reconstruction error per token
+            reconstruction_errors = torch.mean((residuals_flat - forward_output.sae_out) ** 2, dim=1)  # Shape: [total_tokens]
 
             # Prepare context and token data
             for i in range(batch_size):
@@ -219,9 +226,7 @@ def main():
                 for j in range(seq_length):
                     idx_in_batch = i * seq_length + j
 
-                    # Get activation, latent indices, reconstruction error, token, context, position
-                    activation = encoder_output.top_acts[idx_in_batch].detach().cpu().numpy()
-                    latent_indices = encoder_output.top_indices[idx_in_batch].detach().cpu().numpy()
+                    # Get the reconstruction error, token, context, position
                     reconstruction_error = reconstruction_errors[idx_in_batch].item()
                     trigger_token = tokens[j]
                     token_position = j
@@ -231,14 +236,24 @@ def main():
                     end = min(text_length, j + args.context_window + 1)
                     context_tokens = tokens[start:end]
 
-                    # Append to lists
-                    activations_list.append(activation)
-                    latent_indices_list.append(latent_indices)
-                    reconstruction_errors_list.append(reconstruction_error)
-                    trigger_tokens_list.append(trigger_token)
-                    contexts_list.append(context_tokens)
-                    token_positions_list.append(token_position)
-                    sample_ids_list.append(batch_idx * batch_size + i)
+                    # Get the activations and latent indices for this token
+                    activations = latent_acts[idx_in_batch].detach().cpu().numpy()
+                    latent_indices_token = latent_indices[idx_in_batch].detach().cpu().numpy()
+
+                    # For each latent activated for this token
+                    for k in range(len(activations)):
+                        activation_value = activations[k]
+                        latent_index = latent_indices_token[k]
+
+                        # Append to lists
+                        layer_indices_list.append(layer_idx)
+                        sample_ids_list.append(batch_idx * batch_size + i)
+                        latent_indices_list.append(latent_index)
+                        activations_list.append(activation_value)
+                        reconstruction_errors_list.append(reconstruction_error)
+                        trigger_tokens_list.append(trigger_token)
+                        contexts_list.append(context_tokens)
+                        token_positions_list.append(token_position)
 
             # Update progress bar
             progress_bar.set_postfix(batch=batch_idx)
@@ -248,10 +263,10 @@ def main():
 
         # Create a dictionary to store the results
         data = {
-            'layer_index': [layer_idx] * len(activations_list),
+            'layer_index': layer_indices_list,
             'sample_id': sample_ids_list,
+            'latent_index': latent_indices_list,
             'activation': activations_list,
-            'latent_indices': latent_indices_list,
             'reconstruction_error': reconstruction_errors_list,
             'trigger_token': trigger_tokens_list,
             'context': contexts_list,
@@ -259,6 +274,7 @@ def main():
         }
 
         return data
+ 
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
