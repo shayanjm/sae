@@ -259,7 +259,6 @@ def main():
             # Extract expansion_factor from sae_cfg
             if hasattr(sae_cfg, 'expansion_factor'):
                 expansion_factor = sae_cfg.expansion_factor
-                logger.info(f"Rank {rank}: expansion_factor for {layer_to_analyze}: {expansion_factor}")
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
@@ -267,7 +266,6 @@ def main():
             # Extract k from sae_cfg
             if hasattr(sae_cfg, 'k'):
                 k = sae_cfg.k
-                logger.info(f"Rank {rank}: k for {layer_to_analyze}: {k}")
             else:
                 logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
                 raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
@@ -275,7 +273,6 @@ def main():
             # Extract d_in from sae_model
             if hasattr(sae_model, 'd_in'):
                 d_in = sae_model.d_in
-                logger.info(f"Rank {rank}: d_in for {layer_to_analyze}: {d_in}")
             else:
                 logger.error(f"Rank {rank}: SAE model for {layer_to_analyze} lacks 'd_in'")
                 raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
