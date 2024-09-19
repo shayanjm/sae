@@ -14,6 +14,8 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import logging
 import pandas as pd
 from collections import defaultdict
+from torch.utils.tensorboard import SummaryWriter  # Import SummaryWriter
+import torch.profiler  # Import torch.profiler
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +54,28 @@ def main():
     # Set the device for each process
     device = torch.device('cuda', rank) if torch.cuda.is_available() else 'cpu'
     logger.info(f"Rank {rank}/{world_size}, using device: {device}")
+
+    # Initialize TensorBoard SummaryWriter
+    log_dir = os.path.join(args.output_directory, 'logs', f'rank_{rank}')
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    logger.info(f"Rank {rank}: TensorBoard logs will be saved to {log_dir}")
+
+    # Initialize PyTorch Profiler
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=5, repeat=-1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    )
+
+    profiler.start()
+    logger.info(f"Rank {rank}: Profiler started.")
 
     # Load the tokenizer and model from arguments
     model_name = args.model_name
@@ -151,7 +175,7 @@ def main():
     all_token_context_maps = {}
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args):
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
         total_tokens = 0
@@ -167,6 +191,8 @@ def main():
 
         for batch_idx_in_loader, batch in progress_bar:
             try:
+                profiler.step()  # Mark a step for the profiler
+
                 # Move batch to device
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
@@ -218,10 +244,10 @@ def main():
                     activation_value = act_values[idx]
 
                     token = tokens[token_idx]
-                    batch_idx = token_idx // seq_length
+                    batch_idx_inner = token_idx // seq_length
                     seq_idx = token_idx % seq_length
 
-                    tokens_full = tokens_full_list[batch_idx]
+                    tokens_full = tokens_full_list[batch_idx_inner]
                     start_idx = max(0, seq_idx - context_window)
                     end_idx = min(len(tokens_full), seq_idx + context_window + 1)
                     context_text = ' '.join(tokens_full[start_idx:end_idx])
@@ -242,61 +268,65 @@ def main():
         progress_bar.close()
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
 
-    # Process each SAE assigned to this rank
-    for layer_to_analyze in sae_layer_names_per_rank:
-        if layer_to_analyze is None:
-            continue  # Skip padding entries
+    # Profile the data loading and processing section
+    with torch.profiler.record_function("Data Loading and Processing"):
+        # Process each SAE assigned to this rank
+        for layer_to_analyze in sae_layer_names_per_rank:
+            if layer_to_analyze is None:
+                continue  # Skip padding entries
 
-        try:
-            sae_model, sae_cfg = load_sae(layer_to_analyze)
-            sae_model.to(device)
-            sae_model.eval()
+            try:
+                sae_model, sae_cfg = load_sae(layer_to_analyze)
+                sae_model.to(device)
+                sae_model.eval()
 
-            logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
-            expansion_factor = 0
-            k = 0
+                logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
+                expansion_factor = 0
+                k = 0
 
-            # Extract expansion_factor from sae_cfg
-            if hasattr(sae_cfg, 'expansion_factor'):
-                expansion_factor = sae_cfg.expansion_factor
-            else:
-                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
-                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
-            
-            # Extract k from sae_cfg
-            if hasattr(sae_cfg, 'k'):
-                k = sae_cfg.k
-            else:
-                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
-                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
-            
-            # Extract d_in from sae_model
-            if hasattr(sae_model, 'd_in'):
-                d_in = sae_model.d_in
-            else:
-                logger.error(f"Rank {rank}: SAE model for {layer_to_analyze} lacks 'd_in'")
-                raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
+                # Extract expansion_factor from sae_cfg
+                if hasattr(sae_cfg, 'expansion_factor'):
+                    expansion_factor = sae_cfg.expansion_factor
+                else:
+                    logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
+                    raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
+                
+                # Extract k from sae_cfg
+                if hasattr(sae_cfg, 'k'):
+                    k = sae_cfg.k
+                else:
+                    logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
+                    raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
+                
+                # Extract d_in from sae_model
+                if hasattr(sae_model, 'd_in'):
+                    d_in = sae_model.d_in
+                else:
+                    logger.error(f"Rank {rank}: SAE model for {layer_to_analyze} lacks 'd_in'")
+                    raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
 
+                # Call the processing function
+                activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
+                    data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler
+                )
 
-            # Call the processing function
-            activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args
-            )
+                # Accumulate total_tokens
+                total_tokens_rank += total_tokens
 
-            # Accumulate total_tokens
-            total_tokens_rank += total_tokens
+                # Accumulate the results
+                all_activation_counts.append(activation_counts)
+                for neuron_idx, activations in neuron_activation_texts.items():
+                    all_neuron_activation_texts[neuron_idx].extend(activations)
+                all_token_context_maps.update(token_context_map)
 
-            # Accumulate the results
-            all_activation_counts.append(activation_counts)
-            for neuron_idx, activations in neuron_activation_texts.items():
-                all_neuron_activation_texts[neuron_idx].extend(activations)
-            all_token_context_maps.update(token_context_map)
+                logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}.")
 
-            logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}.")
+            except Exception as e:
+                logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
+                raise
 
-        except Exception as e:
-            logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
-            raise
+    profiler.stop()
+    logger.info(f"Rank {rank}: Profiler stopped and data saved to {log_dir}")
 
     # Save all results together at the end
     output_dir = args.output_directory
@@ -353,6 +383,7 @@ def main():
 
     # Clean up
     dist.destroy_process_group()
+    writer.close()  # Close the SummaryWriter
 
 if __name__ == '__main__':
     main()
