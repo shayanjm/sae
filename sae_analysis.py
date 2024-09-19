@@ -41,7 +41,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2,
                         help='Batch size for DataLoader (default: 2)')
     parser.add_argument('--run_name', type=str, default=None,
-                        help='Optional run name for wandb logging')  # Added run_name argument
+                        help='Optional run name for wandb logging')
     args = parser.parse_args()
 
     # Initialize the process group for distributed training
@@ -49,43 +49,27 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # Define the path to SAEs from arguments
-    sae_directory = args.sae_directory
+    # Get the local rank
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
-    # Set the device for each process
-    device = torch.device('cuda', rank) if torch.cuda.is_available() else 'cpu'
-    logger.info(f"Rank {rank}/{world_size}, using device: {device}")
+    # Set the device for each process using local_rank
+    device = torch.device('cuda', local_rank) if torch.cuda.is_available() else 'cpu'
+    logger.info(f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}")
 
-    # Initialize wandb
-    # Rank 0 generates the run_id and run_name and broadcasts them
+    # Initialize wandb only on rank 0
     if rank == 0:
         if args.run_name:
             run_name = args.run_name
         else:
             run_name = None  # Let wandb generate a run name
-        run_id = wandb.util.generate_id()  # Generate a unique run ID
-    else:
-        run_name = None
-        run_id = None
 
-    # Broadcast run_name and run_id to all ranks
-    run_name_list = [run_name]
-    run_id_list = [run_id]
-    dist.broadcast_object_list(run_name_list, src=0)
-    dist.broadcast_object_list(run_id_list, src=0)
-    run_name = run_name_list[0]
-    run_id = run_id_list[0]
-
-    wandb.init(
-        project='sae-analysis',
-        name=run_name,
-        id=run_id,
-        resume='allow',
-        config=vars(args),
-        dir=args.output_directory,
-        settings=wandb.Settings(start_method='thread', console='off', _disable_stats=True)
-    )
-    logger.info(f"Rank {rank}: wandb run initialized.")
+        wandb.init(
+            name=run_name,
+            project="sae-analysis",
+            config=vars(args),
+            save_code=True,
+        )
+        logger.info(f"Rank {rank}: wandb run initialized.")
 
     # Load the tokenizer and model from arguments
     model_name = args.model_name
@@ -102,6 +86,9 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
     model.to(device)
     model.eval()  # Set to evaluation mode
+
+    # Define the path to SAEs from arguments
+    sae_directory = args.sae_directory
 
     # Function to load an SAE
     def load_sae(layer_name):
@@ -193,7 +180,7 @@ def main():
     all_token_context_maps = {}
 
     # Function to process data loader
-    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, wandb):
+    def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
         total_tokens = 0
@@ -276,6 +263,16 @@ def main():
 
                 progress_bar.set_postfix({'Total Tokens': total_tokens})
 
+                # Periodically log data to wandb
+                if batch_idx_in_loader % 10 == 0:
+                    log_data = {
+                        f"Total_Tokens_{layer_to_analyze}/Rank_{rank}": total_tokens,
+                    }
+                    # Only log histograms if on rank 0
+                    if rank == 0:
+                        log_data[f"Activation_Counts_{layer_to_analyze}"] = wandb.Histogram(activation_counts.cpu().numpy())
+                    wandb.log(log_data)
+
             except Exception as e:
                 logger.error(f"Rank {rank}: Error in batch {batch_idx_in_loader}: {e}")
                 raise
@@ -316,11 +313,14 @@ def main():
             context_key_tuple = tuple(context_key.tolist())
             token_context_map[context_key_tuple] = idx
 
-        # Log total tokens and activation counts to wandb
-        wandb.log({
+        # Log final data to wandb
+        log_data = {
             f"Total_Tokens_{layer_to_analyze}/Rank_{rank}": total_tokens,
-            f"Activation_Counts_{layer_to_analyze}/Rank_{rank}": wandb.Histogram(activation_counts.cpu().numpy())
-        })
+        }
+        # Only log histograms if on rank 0
+        if rank == 0:
+            log_data[f"Activation_Counts_{layer_to_analyze}"] = wandb.Histogram(activation_counts.cpu().numpy())
+        wandb.log(log_data)
 
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
 
@@ -361,7 +361,7 @@ def main():
 
             # Call the processing function
             activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, wandb
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args
             )
 
             # Accumulate total_tokens
@@ -441,7 +441,8 @@ def main():
 
     # Clean up
     dist.destroy_process_group()
-    wandb.finish()  # Close the wandb run
+    if rank == 0:
+        wandb.finish()  # Close the wandb run
 
 if __name__ == '__main__':
     main()
