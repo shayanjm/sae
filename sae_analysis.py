@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from torch import nn
+from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -8,7 +8,6 @@ from datasets import load_dataset
 import numpy as np
 import os
 from tqdm import tqdm
-from safetensors.torch import load_file
 from sae.sae import Sae, ForwardOutput, EncoderOutput
 import argparse
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -159,93 +158,73 @@ def main():
         neuron_activation_texts = defaultdict(list)
         token_context_map = {}
         token_context_counter = 0
-
-        # Extract layer index (assuming layer_to_analyze is in the format 'layer.X')
         layer_idx = int(layer_to_analyze.split('.')[-1])
 
-        # Initialize progress bar with position=rank
+        # Progress bar
         data_loader_length = len(data_loader)
         logger.info(f"Rank {rank}: Starting data loader processing. DataLoader length: {data_loader_length}")
-
-        progress_bar = tqdm(
-            enumerate(data_loader),
-            total=data_loader_length,
-            desc=f"Rank {rank} Processing {layer_to_analyze}",
-            position=rank,
-            leave=False  # Adjust as needed
-        )
+        progress_bar = tqdm(enumerate(data_loader), total=data_loader_length, desc=f"Rank {rank} Processing {layer_to_analyze}", position=rank, leave=False)
 
         for batch_idx_in_loader, batch in progress_bar:
             try:
-                # Move inputs to device
+                # Move batch to device
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
-                texts = batch['text']  # List of raw texts in the batch
+                texts = batch['text']
 
                 batch_size_, seq_length = input_ids.size()
 
-                # Extract residuals
-                with torch.no_grad():
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                    hidden_states = outputs.hidden_states
+                # Extract residuals using mixed precision for faster computation
+                with autocast():
+                    with torch.no_grad():
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                        hidden_states = outputs.hidden_states
 
-                residuals = hidden_states[layer_idx + 1]  # Shape: [batch_size, seq_length, hidden_size]
+                residuals = hidden_states[layer_idx + 1].view(batch_size_ * seq_length, -1)
+                total_tokens += residuals.size(0)
 
-                # Reshape residuals to [batch_size * seq_length, hidden_size]
-                residuals = residuals.view(batch_size_ * seq_length, -1)
-                token_batch_size = residuals.size(0)
-                total_tokens += token_batch_size
-
-                # Flatten token IDs and move to CPU for tokenization
-                token_ids = input_ids.view(-1).cpu().numpy()  # Shape: [batch_size * seq_length]
+                # Move tokenization outside the loop (tokenization is CPU-bound)
+                token_ids = input_ids.view(-1).cpu().numpy()
                 tokens = tokenizer.convert_ids_to_tokens(token_ids)
-                torch.save(tokens, f'{layer_to_analyze}_tokens.pt')
 
-                # Precompute full token sequences for each example in the batch
-                tokens_full_list = []
-                for batch_idx in range(batch_size_):
-                    input_ids_batch = input_ids[batch_idx].cpu().numpy()
-                    tokens_full = tokenizer.convert_ids_to_tokens(input_ids_batch)
-                    tokens_full_list.append(tokens_full)
+                # Precompute token sequences in parallel or beforehand
+                tokens_full_list = [tokenizer.convert_ids_to_tokens(input_ids[batch_idx].cpu().numpy()) for batch_idx in range(batch_size_)]
 
-                # Forward pass through SAE model
+                # SAE forward pass
                 with torch.no_grad():
                     forward_output = sae_model(residuals)
                     sae_out = forward_output.sae_out
-                    latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, k]
-                    latent_indices = forward_output.latent_indices.view(token_batch_size, -1)  # Shape: [batch_size * seq_length, k]
+                    latent_acts = forward_output.latent_acts
+                    latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)
 
-                torch.save(latent_acts, f'{layer_to_analyze}_latent_acts.pt')
-                torch.save(latent_indices, f'{layer_to_analyze}_latent_indices.pt')
-                torch.save(sae_out, f'{layer_to_analyze}_sae_out.pt')
-
-                # Create the activation mask
-                activation_mask = torch.zeros(token_batch_size, num_latents, dtype=torch.bool, device=device)
-                activation_values = torch.zeros(token_batch_size, num_latents, dtype=torch.float32, device=device)
+                # Activation mask and values using scatter in one shot
+                activation_mask = torch.zeros(residuals.size(0), num_latents, dtype=torch.bool, device=device)
+                activation_values = torch.zeros(residuals.size(0), num_latents, dtype=torch.float32, device=device)
                 activation_mask.scatter_(1, latent_indices, 1)
                 activation_values.scatter_(1, latent_indices, latent_acts)
                 activation_counts += activation_mask.sum(dim=0)
 
-                # Get indices of active neurons
-                active_token_indices, active_neuron_indices = torch.nonzero(activation_mask, as_tuple=True)
+                # Use batched operations to process activations, avoid looping
+                active_indices = torch.nonzero(activation_mask, as_tuple=False)
+                token_indices = active_indices[:, 0]
+                neuron_indices = active_indices[:, 1]
+                act_values = activation_values[token_indices, neuron_indices]
 
-                # Process activations
-                for idx in range(len(active_token_indices)):
-                    token_index_in_batch = active_token_indices[idx]
-                    neuron_idx = active_neuron_indices[idx]
-                    activation_value = activation_values[token_index_in_batch, neuron_idx]
-                    token = tokens[token_index_in_batch]
+                # Precompute context windows
+                context_window = args.context_window
+                for idx in range(len(token_indices)):
+                    token_idx = token_indices[idx]
+                    neuron_idx = neuron_indices[idx]
+                    activation_value = act_values[idx]
 
-                    batch_idx = token_index_in_batch // seq_length
-                    seq_idx = token_index_in_batch % seq_length
+                    token = tokens[token_idx]
+                    batch_idx = token_idx // seq_length
+                    seq_idx = token_idx % seq_length
+
                     tokens_full = tokens_full_list[batch_idx]
-
-                    # Get context window around the token using args.context_window
-                    context_window = args.context_window
                     start_idx = max(0, seq_idx - context_window)
                     end_idx = min(len(tokens_full), seq_idx + context_window + 1)
-                    context_tokens = tokens_full[start_idx:end_idx]
-                    context_text = ' '.join(context_tokens)
+                    context_text = ' '.join(tokens_full[start_idx:end_idx])
 
                     context_key = (token, context_text)
                     if context_key not in token_context_map:
@@ -254,16 +233,13 @@ def main():
 
                     neuron_activation_texts[neuron_idx].append((activation_value, token_context_map[context_key]))
 
-                # Update progress bar
                 progress_bar.set_postfix({'Total Tokens': total_tokens})
 
             except Exception as e:
                 logger.error(f"Rank {rank}: Error in batch {batch_idx_in_loader}: {e}")
                 raise
 
-        # Close progress bar to prevent overlapping
         progress_bar.close()
-
         return activation_counts, total_tokens, neuron_activation_texts, token_context_map
 
     # Process each SAE assigned to this rank
