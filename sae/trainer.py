@@ -238,8 +238,7 @@ class SaeTrainer:
                 if dist.is_initialized():
                     dist.barrier()
                 hidden_dict.clear()
-                print(f"-->Synchronized at beginning of batch {batch_num} and cleared hidden_dict<--")
-
+                
                 # Bookkeeping for dead feature detection
                 num_tokens_in_step += batch["input_ids"].numel()
 
@@ -247,35 +246,26 @@ class SaeTrainer:
                 handles = [
                     mod.register_forward_hook(hook) for mod in name_to_module.values()
                 ]
-                print(f"Performing forward pass... Set {len(handles)} handles")
                 try:
                     with torch.no_grad():
                         self.model(batch["input_ids"].to(device))
-                    print(f"Performed forward pass")
                 finally:
-                    print(f"Removing handles...")
                     for handle in handles:
                         handle.remove()
-                    print(f"Removed handles")
 
                 # Scatter hiddens if distributing modules
                 if self.cfg.distribute_modules:
-                    print(f"Scattering hiddens...")
                     hidden_dict = self.scatter_hiddens(hidden_dict)
-                    print(f"Scattered hiddens...")
 
                 for name, hiddens in hidden_dict.items():
-                    print(f"Iterating on {name}...")
                     raw = self.saes[name]  # 'raw' never has a DDP wrapper
 
                     # On the first iteration, initialize the decoder bias
                     if self.global_step == 0:
                         median = geometric_median(self.maybe_all_cat(hiddens))
-                        print(f"First iteration. geometric_median: {median}")
                         raw.b_dec.data = median.to(raw.dtype)
 
                     if not maybe_wrapped:
-                        print("Wrapping SAEs with DDP...")
                         # Wrap the SAEs with Distributed Data Parallel
                         maybe_wrapped = (
                             {
@@ -285,23 +275,17 @@ class SaeTrainer:
                             if ddp
                             else self.saes
                         )
-                        print("Wrapped SAEs")
 
                     # Ensure the decoder weights are unit-norm
                     if raw.cfg.normalize_decoder:
-                        print("Ensuring decoder weights are unit-norm")
                         raw.set_decoder_norm_to_unit_norm()
-                        print("Ensured unit-norm decoder weights")
 
                     acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
                     denom = acc_steps * self.cfg.wandb_log_frequency
                     wrapped = maybe_wrapped[name]
-                    print(f"acc_steps: {acc_steps} || denom: {denom}")
                     # Save memory by chunking the activations
-                    print("Chunking activations...")
                     chunk_num = 0
                     for chunk in hiddens.chunk(self.cfg.micro_acc_steps):
-                        print(f"Processing chunk {chunk_num}")
                         out = wrapped(
                             chunk,
                             dead_mask=(
@@ -312,89 +296,58 @@ class SaeTrainer:
                             ),
                         )
 
-                        print(f"Calculating avg_fvu[{name}]...")
                         avg_fvu[name] += float(
                             self.maybe_all_reduce(out.fvu.detach()) / denom
                         )
-                        print(f"avg_fvu[{name}]: {avg_fvu[name]}")
                         if self.cfg.auxk_alpha > 0:
-                            print(f"self.cfg.auxk_alpha > 0 :: self.cfg.auxk_alpha == {self.cfg.auxk_alpha}")
                             avg_auxk_loss[name] += float(
                                 self.maybe_all_reduce(out.auxk_loss.detach()) / denom
                             )
-                            print(f"avg_auxk_loss[{name}]: {avg_auxk_loss[name]}")
                         if self.cfg.sae.multi_topk:
-                            print(f"self.cfg.sae.multi_topk is Truthy :: self.cfg.sae.multi_topk == {self.cfg.sae.multi_topk}")
                             avg_multi_topk_fvu[name] += float(
                                 self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
                             )
-                            print(f"avg_multi_topk_fvu[{name}]: {avg_multi_topk_fvu[name]}")
 
-                        print("Calculating loss...")
                         loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss
-                        print(f"LOSS: {loss}")
                         if self.cfg.sae.multi_topk:
-                            print(f"self.cfg.sae.multi_topk is Truthy :: self.cfg.sae.multi_topk == {self.cfg.sae.multi_topk}")
                             loss += out.multi_topk_fvu / 8
-                            print(f"LOSS: {loss}")
                         loss.div(acc_steps).backward()
 
                         # Update the did_fire mask
-                        print(f"Updating did_fire[{name}]...")
                         did_fire[name][out.latent_indices.flatten()] = True
-                        print(f"Updated did_fire[{name}]. Performing `maybe_all_reduce(did_fire[{name}], 'max')...")
                         self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
-                        print(f"Finished all_reduce")
                         chunk_num += 1
 
                     # Clip gradient norm independently for each SAE
-                    print("Clipping gradient norm...")
                     torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
-                    print("Clipped gradient norm...")
 
                 # Perform optimizer step if necessary
-                print("Calculating step & substep...")
                 step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
-                print(f"step: {step} || substep: {substep}")
                 if substep == 0:
-                    print(f"Substep was 0")
                     if self.cfg.sae.normalize_decoder:
-                        print(f"self.cfg.sae.normalize_decoder is Truthy :: self.cfg.sae.normalize_decoder == {self.cfg.sae.normalize_decoder}")
                         sae_num = 0
                         for sae in self.saes.values():
-                            print(f"Removing gradient parallel to decoder directions on SAE number {sae_num}...")
                             sae.remove_gradient_parallel_to_decoder_directions()
-                            print(f"Removed.")
 
-                    print("Performing optimizer.step()")
                     self.optimizer.step()
-                    print("Stepped optimizer")
                     self.optimizer.zero_grad()
-                    print("Set zero_grad() on optimizer")
                     self.lr_scheduler.step()
-                    print("Stepped lr_scheduler")
 
                     with torch.no_grad():
                         # Update the dead feature mask
                         for name, counts in self.num_tokens_since_fired.items():
-                            print(f"Updating dead feature mask for name {name}...")
                             counts += num_tokens_in_step
-                            print(f"counts: {counts}")
                             counts[did_fire[name]] = 0
-                            print(f"counts[did_fire[{name}]]: {counts[did_fire[name]]}")
 
                         # Reset stats for this step
                         num_tokens_in_step = 0
-                        print("Resetting stats...")
                         for mask in did_fire.values():
                             mask.zero_()
-                        print("Stats reset.")
 
                     if (
                         self.cfg.log_to_wandb
                         and (step + 1) % self.cfg.wandb_log_frequency == 0
                     ):
-                        print("Logging to wandb...")
                         info = {}
 
                         for name in self.saes:
@@ -427,13 +380,11 @@ class SaeTrainer:
 
                         if rank_zero:
                             wandb.log(info, step=step)
-                        print("Finished log block")
 
                     if (step + 1) % self.cfg.save_every == 0:
                         self.save()
 
                 self.global_step += 1
-                print(f"Incrementing global_step: {self.global_step}")
 
                 # Update the progress bar only in rank 0
                 if rank_zero:
@@ -442,7 +393,6 @@ class SaeTrainer:
                 # Synchronize at the end of each batch processing
                 if dist.is_initialized():
                     dist.barrier()
-                print(f"Synchronized at end of {batch_num}")
                 batch_num += 1
 
         # Close the progress bar

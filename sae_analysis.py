@@ -61,17 +61,22 @@ def main():
     writer = SummaryWriter(log_dir=log_dir)
     logger.info(f"Rank {rank}: TensorBoard logs will be saved to {log_dir}")
 
-    # Initialize PyTorch Profiler
+    # Initialize PyTorch Profiler with corrected schedule
     profiler = torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA
         ],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=5, repeat=0),
+        schedule=torch.profiler.schedule(
+            wait=1,      # Steps to wait before starting to profile
+            warmup=1,    # Warm-up steps
+            active=5,    # Steps to actively profile
+            repeat=0     
+        ),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
+        record_shapes=True,      # Enable shape recording
+        profile_memory=True,     # Enable memory profiling
+        with_stack=True          # Capture stack traces
     )
 
     profiler.start()
@@ -173,15 +178,18 @@ def main():
     all_activation_counts = []
     all_neuron_activation_texts = defaultdict(list)
     all_token_context_maps = {}
+    token_context_counter = 0
 
     # Function to process data loader
     def process_data_loader(data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler):
         num_latents = d_in * expansion_factor
         activation_counts = torch.zeros(num_latents, dtype=torch.int32, device=device)
         total_tokens = 0
-        neuron_activation_texts = defaultdict(list)
-        token_context_map = {}
+        all_activation_counts = []
+        all_neuron_activation_texts = defaultdict(list)
+        all_token_context_maps = {}
         token_context_counter = 0
+
         layer_idx = int(layer_to_analyze.split('.')[-1])
 
         # Progress bar
@@ -194,8 +202,8 @@ def main():
                 profiler.step()  # Mark a step for the profiler
 
                 # Move batch to device
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
+                input_ids = batch['input_ids'].to(device)           # Shape: [batch_size, seq_length]
+                attention_mask = batch['attention_mask'].to(device) # Shape: [batch_size, seq_length]
                 texts = batch['text']
 
                 batch_size_, seq_length = input_ids.size()
@@ -206,22 +214,14 @@ def main():
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
                         hidden_states = outputs.hidden_states
 
-                residuals = hidden_states[layer_idx + 1].view(batch_size_ * seq_length, -1)
+                residuals = hidden_states[layer_idx + 1].view(batch_size_ * seq_length, -1)  # Shape: [batch_size * seq_length, hidden_dim]
                 total_tokens += residuals.size(0)
 
-                # Move tokenization outside the loop (tokenization is CPU-bound)
-                token_ids = input_ids.view(-1).cpu().numpy()
-                tokens = tokenizer.convert_ids_to_tokens(token_ids)
-
-                # Precompute token sequences in parallel or beforehand
-                tokens_full_list = [tokenizer.convert_ids_to_tokens(input_ids[batch_idx].cpu().numpy()) for batch_idx in range(batch_size_)]
-
-                # SAE forward pass
-                with torch.no_grad():
-                    forward_output = sae_model(residuals)
-                    sae_out = forward_output.sae_out
-                    latent_acts = forward_output.latent_acts
-                    latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)
+                # Get latent activations and indices
+                forward_output = sae_model(residuals)
+                sae_out = forward_output.sae_out
+                latent_acts = forward_output.latent_acts  # Shape: [batch_size * seq_length, num_latents]
+                latent_indices = forward_output.latent_indices.view(residuals.size(0), -1)  # Shape: [batch_size * seq_length, num_latents]
 
                 # Activation mask and values using scatter in one shot
                 activation_mask = torch.zeros(residuals.size(0), num_latents, dtype=torch.bool, device=device)
@@ -230,34 +230,68 @@ def main():
                 activation_values.scatter_(1, latent_indices, latent_acts)
                 activation_counts += activation_mask.sum(dim=0)
 
-                # Use batched operations to process activations, avoid looping
-                active_indices = torch.nonzero(activation_mask, as_tuple=False)
-                token_indices = active_indices[:, 0]
-                neuron_indices = active_indices[:, 1]
-                act_values = activation_values[token_indices, neuron_indices]
+                # Find active indices
+                active_indices = activation_mask.nonzero(as_tuple=False)  # Shape: [num_activations, 2]
+                token_indices = active_indices[:, 0]  # Indices of tokens in residuals
+                neuron_indices = active_indices[:, 1]  # Neuron indices
 
-                # Precompute context windows
-                context_window = args.context_window
-                for idx in range(len(token_indices)):
-                    token_idx = token_indices[idx]
-                    neuron_idx = neuron_indices[idx]
-                    activation_value = act_values[idx]
+                # Convert to CPU for context extraction (string operations cannot be performed on GPU)
+                token_indices_cpu = token_indices.cpu()
+                neuron_indices_cpu = neuron_indices.cpu()
+                act_values_cpu = activation_values[token_indices, neuron_indices].cpu()
 
-                    token = tokens[token_idx]
-                    batch_idx_inner = token_idx // seq_length
-                    seq_idx = token_idx % seq_length
+                # Calculate batch and sequence indices
+                batch_indices = token_indices_cpu // seq_length  # Shape: [num_activations]
+                seq_indices = token_indices_cpu % seq_length    # Shape: [num_activations]
 
-                    tokens_full = tokens_full_list[batch_idx_inner]
-                    start_idx = max(0, seq_idx - context_window)
-                    end_idx = min(len(tokens_full), seq_idx + context_window + 1)
-                    context_text = ' '.join(tokens_full[start_idx:end_idx])
+                # Calculate start and end indices for context window
+                start_indices = (seq_indices - args.context_window).clamp(min=0)
+                end_indices = (seq_indices + args.context_window + 1).clamp(max=seq_length)
 
-                    context_key = (token, context_text)
-                    if context_key not in token_context_map:
-                        token_context_map[context_key] = token_context_counter
+                max_context_length = args.context_window * 2 + 1  # Maximum number of tokens in context
+
+                # Initialize tensor to hold context token IDs
+                context_token_ids = torch.full((token_indices_cpu.size(0), max_context_length), tokenizer.pad_token_id, dtype=torch.long, device=device)
+
+                for i in range(max_context_length):
+                    # Compute relative positions
+                    relative_pos = i - args.context_window
+                    # Calculate actual positions with clamping
+                    positions = (seq_indices + relative_pos).clamp(min=0, max=seq_length - 1)
+                    # Gather token IDs
+                    context_token_ids[:, i] = input_ids[batch_indices, positions]
+
+                # Move context_token_ids to CPU for hashing/mapping
+                context_token_ids_cpu = context_token_ids.cpu()
+
+                # Create unique context keys by converting token IDs to tuples
+                context_keys = [tuple(context_token_ids_cpu[i].tolist()) for i in range(context_token_ids_cpu.size(0))]
+
+                # Identify unique contexts and their inverse indices
+                unique_context_keys, inverse_indices = torch.unique(context_token_ids_cpu, return_inverse=True, dim=0)
+                unique_context_keys = unique_context_keys.tolist()
+
+                # Assign unique indices to context keys
+                for idx, context_key in enumerate(unique_context_keys):
+                    if context_key not in all_token_context_maps:
+                        all_token_context_maps[context_key] = token_context_counter
                         token_context_counter += 1
 
-                    neuron_activation_texts[neuron_idx].append((activation_value, token_context_map[context_key]))
+                # Retrieve context indices for each activation
+                context_indices = [all_token_context_maps[tuple(ctx)] for ctx in unique_context_keys]
+                context_indices_tensor = torch.tensor(context_indices, device=device)
+
+                # Assign context indices to activations using inverse_indices
+                activation_context_indices = context_indices_tensor[inverse_indices]
+
+                # Convert neuron indices to CPU for mapping
+                neuron_indices_list = neuron_indices_cpu.tolist()
+                activation_values_list = act_values_cpu.tolist()
+                activation_context_indices_list = activation_context_indices.cpu().tolist()
+
+                # Accumulate neuron activation texts
+                for neuron_idx, activation_value, context_idx in zip(neuron_indices_list, activation_values_list, activation_context_indices_list):
+                    all_neuron_activation_texts[neuron_idx].append((activation_value, context_idx))
 
                 progress_bar.set_postfix({'Total Tokens': total_tokens})
 
@@ -266,64 +300,63 @@ def main():
                 raise
 
         progress_bar.close()
-        return activation_counts, total_tokens, neuron_activation_texts, token_context_map
+        return activation_counts, total_tokens, all_neuron_activation_texts, all_token_context_maps
 
-    # Profile the data loading and processing section
-    with torch.profiler.record_function("Data Loading and Processing"):
-        # Process each SAE assigned to this rank
-        for layer_to_analyze in sae_layer_names_per_rank:
-            if layer_to_analyze is None:
-                continue  # Skip padding entries
+    # Process each SAE assigned to this rank
+    for layer_to_analyze in sae_layer_names_per_rank:
+        if layer_to_analyze is None:
+            continue  # Skip padding entries
 
-            try:
-                sae_model, sae_cfg = load_sae(layer_to_analyze)
-                sae_model.to(device)
-                sae_model.eval()
+        try:
+            sae_model, sae_cfg = load_sae(layer_to_analyze)
+            sae_model.to(device)
+            sae_model.eval()
 
-                logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
-                expansion_factor = 0
-                k = 0
+            logger.info(f"Rank {rank}: Processing {layer_to_analyze}")
+            expansion_factor = 0
+            k = 0
 
-                # Extract expansion_factor from sae_cfg
-                if hasattr(sae_cfg, 'expansion_factor'):
-                    expansion_factor = sae_cfg.expansion_factor
-                else:
-                    logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
-                    raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
-                
-                # Extract k from sae_cfg
-                if hasattr(sae_cfg, 'k'):
-                    k = sae_cfg.k
-                else:
-                    logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
-                    raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
-                
-                # Extract d_in from sae_model
-                if hasattr(sae_model, 'd_in'):
-                    d_in = sae_model.d_in
-                else:
-                    logger.error(f"Rank {rank}: SAE model for {layer_to_analyze} lacks 'd_in'")
-                    raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
+            # Extract expansion_factor from sae_cfg
+            if hasattr(sae_cfg, 'expansion_factor'):
+                expansion_factor = sae_cfg.expansion_factor
+            else:
+                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'expansion_factor'")
+                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'expansion_factor'")
+            
+            # Extract k from sae_cfg
+            if hasattr(sae_cfg, 'k'):
+                k = sae_cfg.k
+            else:
+                logger.error(f"Rank {rank}: SAE config for {layer_to_analyze} lacks 'k'")
+                raise AttributeError(f"Sae config for {layer_to_analyze} lacks 'k'")
+            
+            # Extract d_in from sae_model
+            if hasattr(sae_model, 'd_in'):
+                d_in = sae_model.d_in
+            else:
+                logger.error(f"Rank {rank}: SAE model for {layer_to_analyze} lacks 'd_in'")
+                raise AttributeError(f"Sae model for {layer_to_analyze} lacks 'd_in'")
 
-                # Call the processing function
-                activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
-                    data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler
-                )
+            # Call the processing function
+            activation_counts, total_tokens, neuron_activation_texts, token_context_map = process_data_loader(
+                data_loader, model, sae_model, tokenizer, layer_to_analyze, k, d_in, expansion_factor, device, args, profiler
+            )
 
-                # Accumulate total_tokens
-                total_tokens_rank += total_tokens
+            # Accumulate total_tokens
+            total_tokens_rank += total_tokens
 
-                # Accumulate the results
-                all_activation_counts.append(activation_counts)
-                for neuron_idx, activations in neuron_activation_texts.items():
-                    all_neuron_activation_texts[neuron_idx].extend(activations)
-                all_token_context_maps.update(token_context_map)
+            # Accumulate the results
+            all_activation_counts.append(activation_counts)
+            for neuron_idx, activations in neuron_activation_texts.items():
+                all_neuron_activation_texts[neuron_idx].extend(activations)
+            for context_key, context_idx in token_context_map.items():
+                all_token_context_maps[context_key] = context_idx
 
-                logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}.")
+            logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}.")
 
-            except Exception as e:
-                logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
-                raise
+        except Exception as e:
+            logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
+            raise
 
     profiler.stop()
     logger.info(f"Rank {rank}: Profiler stopped and data saved to {log_dir}")
@@ -334,7 +367,7 @@ def main():
 
     # Save activation counts as memory-mapped arrays
     if all_activation_counts:
-        np.save(os.path.join(output_dir, f'all_activation_counts_{rank}.npy'), np.concatenate(all_activation_counts))
+        np.save(os.path.join(output_dir, f'all_activation_counts_{rank}.npy'), torch.cat(all_activation_counts).cpu().numpy())
     else:
         logger.warning(f"Rank {rank}: No activation counts to save.")
 
@@ -351,7 +384,12 @@ def main():
 
     # Save token context map as Parquet
     if all_token_context_maps:
-        token_context_df = pd.DataFrame(list(all_token_context_maps.items()), columns=['context_key', 'context_index'])
+        # Convert context keys (tuples of token IDs) to strings or another suitable format
+        # Here, we'll convert them to strings for storage
+        token_context_df = pd.DataFrame([
+            {'context_key': ' '.join(map(str, k)), 'context_index': v}
+            for k, v in all_token_context_maps.items()
+        ])
         output_file_context_map = os.path.join(output_dir, f'context_map_{rank}.parquet')
         token_context_df.to_parquet(output_file_context_map)
     else:
