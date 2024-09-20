@@ -71,17 +71,14 @@ def main():
         help="Batch size for DataLoader (default: 2)",
     )
     args = parser.parse_args()
-
-    # Initialize the process group for distributed training
-    dist.init_process_group(backend="nccl", init_method="env://")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Get the local rank
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"    
+    
     # Set the device for each process using local_rank
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"
     logger.info(
         f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
     )
@@ -114,6 +111,18 @@ def main():
             return_tensors="pt",
         )
         return tokenized
+    
+    # Load and tokenize the dataset from arguments
+    dataset_name = args.dataset_name
+    dataset = load_dataset(dataset_name, split="train")
+
+    if args.dataset_rows is not None:
+        dataset = dataset.select(range(args.dataset_rows))
+
+    tokenized_dataset = dataset.map(tokenize_function, batched=True)
+
+    # Initialize the process group for distributed training
+    dist.init_process_group(backend="nccl", init_method="env://")
 
     # Get list of SAEs and distribute among processes
     sae_layer_names = [
@@ -148,15 +157,7 @@ def main():
     # Each rank retrieves its assigned SAEs
     sae_layer_names_per_rank = sae_assignment[rank]
 
-    # Load and tokenize the dataset from arguments
-    dataset_name = args.dataset_name
-    dataset = load_dataset(dataset_name, split="train")
-
-    if args.dataset_rows is not None:
-        dataset = dataset.select(range(args.dataset_rows))
-
-    tokenized_dataset = dataset.map(tokenize_function, batched=True)
-
+   
     # Define custom Dataset class
     class TokenizedDataset(Dataset):
         def __init__(self, tokenized_data):
