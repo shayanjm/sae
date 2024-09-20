@@ -113,7 +113,6 @@ def main():
             max_length=args.max_token_length,
             return_tensors="pt",
         )
-        tokenized["text"] = examples["text"]  # Retain the 'text' field
         return tokenized
 
     # Get list of SAEs and distribute among processes
@@ -190,6 +189,8 @@ def main():
         sampler=sampler,
         shuffle=False,
         drop_last=True,
+        pin_memory=True,
+        num_workers=4,
     )
 
     # Log DataLoader length
@@ -243,7 +244,6 @@ def main():
         for batch_idx, batch in enumerate(progress_bar):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            texts = batch["text"]
 
             # Forward pass through the model
             with torch.no_grad():
@@ -290,7 +290,6 @@ def main():
 
             # Prepare context and token data
             for i in range(batch_size):
-                text = texts[i]
                 input_id_sequence = input_ids[i]
                 tokens = tokenizer.convert_ids_to_tokens(input_id_sequence)
                 text_length = len(tokens)
