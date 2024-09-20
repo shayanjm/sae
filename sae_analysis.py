@@ -454,18 +454,13 @@ def main():
             final_table = pa.concat_tables(combined_tables, promote=True)
 
             # Save the combined table with a progress bar
-            logger.info("Rank 0: Writing combined Parquet file.")
+            logger.info("Rank 0: Writing combined Parquet file...")
             final_output_dir = os.path.join(args.output_directory, "combined")
             os.makedirs(final_output_dir, exist_ok=True)
             final_output_file = os.path.join(final_output_dir, "all_layers.parquet")
 
-            # Since pq.write_table doesn't support progress, we can simulate progress
-            # Simulate progress bar for writing (assuming it takes time)
-            with tqdm(
-                total=1, desc="Writing combined Parquet file", ncols=80
-            ) as write_pbar:
-                pq.write_table(final_table, final_output_file, compression="snappy")
-                write_pbar.update(1)
+            # Since pq.write_table doesn't support progress, we can't show a pbar for this
+            pq.write_table(final_table, final_output_file, compression="snappy")
 
             logger.info(f"Rank {rank}: Aggregated results saved to {final_output_file}")
         else:
