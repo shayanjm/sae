@@ -71,17 +71,8 @@ def main():
         help="Batch size for DataLoader (default: 2)",
     )
     args = parser.parse_args()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    # Get the local rank
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"    
     
-    # Set the device for each process using local_rank
-    logger.info(
-        f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
-    )
+    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"    
 
     # Load the tokenizer and model from arguments
     model_name = args.model_name
@@ -122,7 +113,18 @@ def main():
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
 
     # Initialize the process group for distributed training
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group(backend="nccl", init_method="env://"
+                            )
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()    
+    
+    # Get the local rank
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    # Set the device for each process using local_rank
+    logger.info(
+        f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
+    )
 
     # Get list of SAEs and distribute among processes
     sae_layer_names = [
