@@ -49,7 +49,7 @@ def main():
     parser.add_argument(
         "--dataset_rows",
         type=int,
-        default=None,
+        default=1000,
         help="Number of rows from the dataset to use (default: all)",
     )
     parser.add_argument(
@@ -70,6 +70,13 @@ def main():
         default=2,
         help="Batch size for DataLoader (default: 2)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for dataset sampling (default: 42)",
+    )
+
     args = parser.parse_args()
     
     # Load the tokenizer and model from arguments
@@ -100,9 +107,8 @@ def main():
     # Load and tokenize the dataset from arguments
     dataset_name = args.dataset_name
     dataset = load_dataset(dataset_name, split="train")
-
-    if args.dataset_rows is not None:
-        dataset = dataset.select(range(args.dataset_rows))
+    dataset = dataset.shuffle(seed=args.seed)
+    dataset = dataset.select(range(args.dataset_rows))
 
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
 
@@ -183,7 +189,7 @@ def main():
 
     # Create DistributedSampler and DataLoader
     sampler = DistributedSampler(
-        torch_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        torch_dataset, num_replicas=world_size, rank=rank,
     )
     batch_size = args.batch_size
     data_loader = DataLoader(
