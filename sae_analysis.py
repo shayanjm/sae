@@ -116,11 +116,11 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     # Set the device for each process using local_rank
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"
+
     logger.info(
         f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
     )
-
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"
     
     model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
     model.to(device)
