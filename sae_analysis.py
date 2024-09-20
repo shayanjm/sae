@@ -72,16 +72,10 @@ def main():
     )
     args = parser.parse_args()
     
-    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"    
-
     # Load the tokenizer and model from arguments
     model_name = args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
-    model.to(device)
-    model.eval()  # Set to evaluation mode
 
     # Define the path to SAEs from arguments
     sae_directory = args.sae_directory
@@ -125,6 +119,12 @@ def main():
     logger.info(
         f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
     )
+
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else "cpu"
+    
+    model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
+    model.to(device)
+    model.eval()  # Set to evaluation mode
 
     # Get list of SAEs and distribute among processes
     sae_layer_names = [
