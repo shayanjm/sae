@@ -193,7 +193,7 @@ def main():
         shuffle=False,
         drop_last=True,
         pin_memory=True,
-        num_workers=4,
+        num_workers=0,  # Set num_workers to 0 to reduce memory usage
     )
 
     # Log DataLoader length
@@ -218,15 +218,25 @@ def main():
 
         layer_idx = int(layer_to_analyze.split(".")[-1])
 
-        # Initialize lists to store results
-        layer_indices_list = []
-        sample_ids_list = []
-        latent_indices_list = []
-        activations_list = []
-        reconstruction_errors_list = []
-        trigger_tokens_list = []
-        contexts_list = []
-        token_positions_list = []
+        # Create output file path
+        output_dir = os.path.join(args.output_directory, f"rank_{rank}")
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"{layer_to_analyze}.parquet")
+
+        # Define the schema
+        schema = pa.schema([
+            ('layer_index', pa.int32()),
+            ('sample_id', pa.int32()),
+            ('latent_index', pa.int32()),
+            ('activation', pa.float32()),
+            ('reconstruction_error', pa.float32()),
+            ('trigger_token', pa.string()),
+            ('context', pa.list_(pa.string())),
+            ('token_position', pa.int32()),
+        ])
+
+        # Create a ParquetWriter
+        writer = pq.ParquetWriter(output_file, schema, compression='snappy')
 
         # Start processing
         logger.info(
@@ -292,6 +302,18 @@ def main():
             )  # Shape: [total_tokens]
 
             # Prepare context and token data
+            # Initialize lists to store data for this batch
+            data_batch = {
+                "layer_index": [],
+                "sample_id": [],
+                "latent_index": [],
+                "activation": [],
+                "reconstruction_error": [],
+                "trigger_token": [],
+                "context": [],
+                "token_position": [],
+            }
+
             for i in range(batch_size):
                 input_id_sequence = input_ids[i]
                 tokens = tokenizer.convert_ids_to_tokens(input_id_sequence)
@@ -321,15 +343,49 @@ def main():
                         activation_value = activations[k]
                         latent_index = latent_indices_token[k]
 
-                        # Append to lists
-                        layer_indices_list.append(layer_idx)
-                        sample_ids_list.append(batch_idx * batch_size + i)
-                        latent_indices_list.append(latent_index)
-                        activations_list.append(activation_value)
-                        reconstruction_errors_list.append(reconstruction_error)
-                        trigger_tokens_list.append(trigger_token)
-                        contexts_list.append(context_tokens)
-                        token_positions_list.append(token_position)
+                        # Append to batch data
+                        data_batch["layer_index"].append(layer_idx)
+                        data_batch["sample_id"].append(batch_idx * batch_size + i)
+                        data_batch["latent_index"].append(latent_index)
+                        data_batch["activation"].append(activation_value)
+                        data_batch["reconstruction_error"].append(reconstruction_error)
+                        data_batch["trigger_token"].append(trigger_token)
+                        data_batch["context"].append(context_tokens)
+                        data_batch["token_position"].append(token_position)
+
+            # Convert data_batch to PyArrow Table
+            batch_table = pa.Table.from_pydict({
+                "layer_index": pa.array(data_batch["layer_index"], type=pa.int32()),
+                "sample_id": pa.array(data_batch["sample_id"], type=pa.int32()),
+                "latent_index": pa.array(data_batch["latent_index"], type=pa.int32()),
+                "activation": pa.array(data_batch["activation"], type=pa.float32()),
+                "reconstruction_error": pa.array(
+                    data_batch["reconstruction_error"], type=pa.float32()
+                ),
+                "trigger_token": pa.array(data_batch["trigger_token"], type=pa.string()),
+                "context": pa.array(data_batch["context"], type=pa.list_(pa.string())),
+                "token_position": pa.array(data_batch["token_position"], type=pa.int32()),
+            })
+
+            # Write batch_table to Parquet file
+            writer.write_table(batch_table)
+
+            # Clear data_batch to free up memory
+            del data_batch
+            del batch_table
+
+            # Clear variables to free up memory
+            del input_ids
+            del attention_mask
+            del outputs
+            del hidden_states
+            del residuals
+            del residuals_flat
+            del forward_output
+            del latent_indices
+            del latent_acts
+            del reconstruction_errors
+            torch.cuda.empty_cache()
 
             # Update progress bar
             progress_bar.set_postfix(batch=batch_idx)
@@ -337,19 +393,10 @@ def main():
         # Close the progress bar
         progress_bar.close()
 
-        # Create a dictionary to store the results
-        data = {
-            "layer_index": layer_indices_list,
-            "sample_id": sample_ids_list,
-            "latent_index": latent_indices_list,
-            "activation": activations_list,
-            "reconstruction_error": reconstruction_errors_list,
-            "trigger_token": trigger_tokens_list,
-            "context": contexts_list,
-            "token_position": token_positions_list,
-        }
+        # Close the ParquetWriter
+        writer.close()
 
-        return data
+        logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}")
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
@@ -382,7 +429,7 @@ def main():
                 raise AttributeError(f"SAE model for {layer_to_analyze} lacks 'd_in'")
 
             # Call the processing function
-            data = process_data_loader(
+            process_data_loader(
                 data_loader,
                 model,
                 sae_model,
@@ -394,32 +441,6 @@ def main():
                 tokenizer,
                 rank,
             )
-
-            # Save the results to a Parquet file
-            output_dir = os.path.join(args.output_directory, f"rank_{rank}")
-            os.makedirs(output_dir, exist_ok=True)
-            output_file = os.path.join(output_dir, f"{layer_to_analyze}.parquet")
-
-            # Convert data to PyArrow Table
-            table = pa.Table.from_pydict(
-                {
-                    "layer_index": pa.array(data["layer_index"], type=pa.int32()),
-                    "sample_id": pa.array(data["sample_id"], type=pa.int32()),
-                    "latent_index": pa.array(data["latent_index"], type=pa.int32()),
-                    "activation": pa.array(data["activation"], type=pa.float32()),
-                    "reconstruction_error": pa.array(
-                        data["reconstruction_error"], type=pa.float32()
-                    ),
-                    "trigger_token": pa.array(data["trigger_token"], type=pa.string()),
-                    "context": pa.array(data["context"], type=pa.list_(pa.string())),
-                    "token_position": pa.array(data["token_position"], type=pa.int32()),
-                }
-            )
-
-            # Write the table to a Parquet file with compression
-            pq.write_table(table, output_file, compression="snappy")
-
-            logger.info(f"Rank {rank}: Saved results to {output_file}")
 
         except Exception as e:
             logger.error(f"Rank {rank}: Error processing {layer_to_analyze}: {e}")
@@ -455,13 +476,12 @@ def main():
             logger.info("Rank 0: Concatenating tables.")
             final_table = pa.concat_tables(combined_tables, promote=True)
 
-            # Save the combined table with a progress bar
+            # Save the combined table
             logger.info("Rank 0: Writing combined Parquet file...")
             final_output_dir = os.path.join(args.output_directory, "combined")
             os.makedirs(final_output_dir, exist_ok=True)
             final_output_file = os.path.join(final_output_dir, "all_layers.parquet")
 
-            # Since pq.write_table doesn't support progress, we can't show a pbar for this
             pq.write_table(final_table, final_output_file, compression="snappy")
 
             logger.info(f"Rank {rank}: Aggregated results saved to {final_output_file}")
