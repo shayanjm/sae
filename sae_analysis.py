@@ -50,7 +50,7 @@ def main():
         "--dataset_rows",
         type=int,
         default=1000,
-        help="Number of rows from the dataset to use (default: all)",
+        help="Number of rows from the dataset to use (default: 1000)",
     )
     parser.add_argument(
         "--max_token_length",
@@ -75,6 +75,11 @@ def main():
         type=int,
         default=42,
         help="Random seed for dataset sampling (default: 42)",
+    )
+    parser.add_argument(
+        "--combine_output",
+        action="store_true",
+        help="If set, combine all output parquet files into a single file at the end",
     )
 
     args = parser.parse_args()
@@ -458,7 +463,7 @@ def main():
     dist.barrier()
 
     # Aggregate across ranks and save as needed here
-    if rank == 0:
+    if args.combine_output and rank == 0:
         logger.info("Rank 0: Starting aggregation of results.")
 
         # Collect Parquet files from all ranks
