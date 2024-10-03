@@ -111,7 +111,7 @@ def main():
     
     # Load and tokenize the dataset from arguments
     dataset_name = args.dataset_name
-    dataset = load_dataset(dataset_name, split="train")
+    dataset = load_dataset(dataset_name, split="train", trust_remote_code=True)
     dataset = dataset.shuffle(seed=args.seed)
     dataset = dataset.select(range(args.dataset_rows))
 
