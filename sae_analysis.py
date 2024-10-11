@@ -76,11 +76,6 @@ def main():
         default=42,
         help="Random seed for dataset sampling (default: 42)",
     )
-    parser.add_argument(
-        "--combine_output",
-        action="store_true",
-        help="If set, combine all output parquet files into a single file at the end",
-    )
 
     args = parser.parse_args()
 
@@ -244,6 +239,7 @@ def main():
                 ("layer_index", pa.int32()),
                 ("sample_id", pa.int32()),
                 ("latent_index", pa.int32()),
+                ("latent_bin", pa.int32()),  # New column
                 ("activation", pa.float32()),
                 ("reconstruction_error", pa.float32()),
                 ("trigger_token", pa.string()),
@@ -324,6 +320,7 @@ def main():
                 "layer_index": [],
                 "sample_id": [],
                 "latent_index": [],
+                "latent_bin": [],  # New column
                 "activation": [],
                 "reconstruction_error": [],
                 "trigger_token": [],
@@ -359,8 +356,9 @@ def main():
                     for k in range(len(activations)):
                         activation_value = activations[k]
                         latent_index = int(latent_indices_token[k])
+                        latent_bin = latent_index % 1024  # Bucket by max partitions
 
-                        # Update per_neuron_stats
+                        # Update per-neuron stats
                         if latent_index not in per_neuron_stats:
                             per_neuron_stats[latent_index] = {
                                 "count": 0,
@@ -380,6 +378,7 @@ def main():
                         data_batch["layer_index"].append(layer_idx)
                         data_batch["sample_id"].append(batch_idx * batch_size + i)
                         data_batch["latent_index"].append(latent_index)
+                        data_batch["latent_bin"].append(latent_bin)  # New column
                         data_batch["activation"].append(activation_value)
                         data_batch["reconstruction_error"].append(reconstruction_error)
                         data_batch["trigger_token"].append(trigger_token)
@@ -393,6 +392,9 @@ def main():
                     "sample_id": pa.array(data_batch["sample_id"], type=pa.int32()),
                     "latent_index": pa.array(
                         data_batch["latent_index"], type=pa.int32()
+                    ),
+                    "latent_bin": pa.array(  # New column
+                        data_batch["latent_bin"], type=pa.int32()
                     ),
                     "activation": pa.array(data_batch["activation"], type=pa.float32()),
                     "reconstruction_error": pa.array(
@@ -410,11 +412,13 @@ def main():
                 }
             )
 
-            # Write batch_table to Parquet dataset partitioned by 'latent_index'
+            # Write batch_table to Parquet dataset partitioned by 'latent_bin'
             pq.write_to_dataset(
                 table=batch_table,
                 root_path=output_data_dir,
-                partition_cols=["layer_index", "latent_index"],
+                partition_cols=["latent_bin"],
+                use_legacy_dataset=False,
+                max_partitions=1024,  # Set max_partitions to 1024
             )
 
             # Clear variables to free up memory
@@ -542,52 +546,9 @@ def main():
 
     logger.info(f"Rank {rank}: All results processed.")
 
-    # Synchronize before final aggregation
+    # Synchronize
     dist.barrier()
-
-    # Aggregate across ranks and save as needed here
-    if args.combine_output and rank == 0:
-        logger.info("Rank 0: Starting aggregation of summaries.")
-
-        # Collect summary Parquet files from all ranks
-        summary_files = []
-        for r in range(world_size):
-            summary_dir = os.path.join(args.output_directory, f"rank_{r}", "summary")
-            if os.path.exists(summary_dir):
-                for fname in os.listdir(summary_dir):
-                    if fname.endswith("_summary.parquet"):
-                        summary_files.append(os.path.join(summary_dir, fname))
-
-        # Read all summary Parquet files and combine them
-        summary_tables = []
-        logger.info("Rank 0: Reading summary Parquet files from all ranks.")
-        for file in tqdm(summary_files, desc="Aggregating summary files", ncols=80):
-            table = pq.read_table(file)
-            summary_tables.append(table)
-
-        if summary_tables:
-            # Concatenate all tables
-            logger.info("Rank 0: Concatenating summary tables.")
-            final_summary_table = pa.concat_tables(summary_tables, promote=True)
-
-            # Save the combined summary table
-            logger.info("Rank 0: Writing combined summary Parquet file...")
-            final_output_dir = os.path.join(args.output_directory, "combined")
-            os.makedirs(final_output_dir, exist_ok=True)
-            final_summary_file = os.path.join(
-                final_output_dir, "all_layers_summary.parquet"
-            )
-
-            pq.write_table(
-                final_summary_table, final_summary_file, compression="snappy"
-            )
-
-            logger.info(
-                f"Rank {rank}: Aggregated summary saved to {final_summary_file}"
-            )
-        else:
-            logger.info("Rank 0: No summary data to aggregate.")
-
+    
     # Clean up
     dist.destroy_process_group()
 
