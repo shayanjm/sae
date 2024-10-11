@@ -83,7 +83,7 @@ def main():
     )
 
     args = parser.parse_args()
-    
+
     # Load the tokenizer and model from arguments
     model_name = args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -108,7 +108,7 @@ def main():
             return_tensors="pt",
         )
         return tokenized
-    
+
     # Load and tokenize the dataset from arguments
     dataset_name = args.dataset_name
     dataset = load_dataset(dataset_name, split="train", trust_remote_code=True)
@@ -118,11 +118,10 @@ def main():
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
 
     # Initialize the process group for distributed training
-    dist.init_process_group(backend="nccl", init_method="env://"
-                            )
+    dist.init_process_group(backend="nccl", init_method="env://")
     rank = dist.get_rank()
-    world_size = dist.get_world_size()    
-    
+    world_size = dist.get_world_size()
+
     # Get the local rank
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
@@ -132,7 +131,7 @@ def main():
     logger.info(
         f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
     )
-    
+
     model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
     model.to(device)
     model.eval()  # Set to evaluation mode
@@ -170,7 +169,6 @@ def main():
     # Each rank retrieves its assigned SAEs
     sae_layer_names_per_rank = sae_assignment[rank]
 
-   
     # Define custom Dataset class
     class TokenizedDataset(Dataset):
         def __init__(self, tokenized_data):
@@ -194,7 +192,9 @@ def main():
 
     # Create DistributedSampler and DataLoader
     sampler = DistributedSampler(
-        torch_dataset, num_replicas=world_size, rank=rank,
+        torch_dataset,
+        num_replicas=world_size,
+        rank=rank,
     )
     batch_size = args.batch_size
     data_loader = DataLoader(
@@ -229,25 +229,31 @@ def main():
 
         layer_idx = int(layer_to_analyze.split(".")[-1])
 
-        # Create output file path
-        output_dir = os.path.join(args.output_directory, f"rank_{rank}")
-        os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"{layer_to_analyze}.parquet")
+        # Create output directories
+        output_data_dir = os.path.join(args.output_directory, f"rank_{rank}", "data")
+        os.makedirs(output_data_dir, exist_ok=True)
+
+        output_summary_dir = os.path.join(
+            args.output_directory, f"rank_{rank}", "summary"
+        )
+        os.makedirs(output_summary_dir, exist_ok=True)
 
         # Define the schema
-        schema = pa.schema([
-            ('layer_index', pa.int32()),
-            ('sample_id', pa.int32()),
-            ('latent_index', pa.int32()),
-            ('activation', pa.float32()),
-            ('reconstruction_error', pa.float32()),
-            ('trigger_token', pa.string()),
-            ('context', pa.list_(pa.string())),
-            ('token_position', pa.int32()),
-        ])
+        schema = pa.schema(
+            [
+                ("layer_index", pa.int32()),
+                ("sample_id", pa.int32()),
+                ("latent_index", pa.int32()),
+                ("activation", pa.float32()),
+                ("reconstruction_error", pa.float32()),
+                ("trigger_token", pa.string()),
+                ("context", pa.list_(pa.string())),
+                ("token_position", pa.int32()),
+            ]
+        )
 
-        # Create a ParquetWriter
-        writer = pq.ParquetWriter(output_file, schema, compression='snappy')
+        # Initialize per-neuron statistics
+        per_neuron_stats = {}  # key: latent_index, value: dict with stats
 
         # Start processing
         logger.info(
@@ -352,7 +358,23 @@ def main():
                     # For each latent activated for this token
                     for k in range(len(activations)):
                         activation_value = activations[k]
-                        latent_index = latent_indices_token[k]
+                        latent_index = int(latent_indices_token[k])
+
+                        # Update per_neuron_stats
+                        if latent_index not in per_neuron_stats:
+                            per_neuron_stats[latent_index] = {
+                                "count": 0,
+                                "sum_activation": 0.0,
+                                "sum_activation_sq": 0.0,
+                            }
+
+                        per_neuron_stats[latent_index]["count"] += 1
+                        per_neuron_stats[latent_index][
+                            "sum_activation"
+                        ] += activation_value
+                        per_neuron_stats[latent_index]["sum_activation_sq"] += (
+                            activation_value**2
+                        )
 
                         # Append to batch data
                         data_batch["layer_index"].append(layer_idx)
@@ -365,25 +387,35 @@ def main():
                         data_batch["token_position"].append(token_position)
 
             # Convert data_batch to PyArrow Table
-            batch_table = pa.Table.from_pydict({
-                "layer_index": pa.array(data_batch["layer_index"], type=pa.int32()),
-                "sample_id": pa.array(data_batch["sample_id"], type=pa.int32()),
-                "latent_index": pa.array(data_batch["latent_index"], type=pa.int32()),
-                "activation": pa.array(data_batch["activation"], type=pa.float32()),
-                "reconstruction_error": pa.array(
-                    data_batch["reconstruction_error"], type=pa.float32()
-                ),
-                "trigger_token": pa.array(data_batch["trigger_token"], type=pa.string()),
-                "context": pa.array(data_batch["context"], type=pa.list_(pa.string())),
-                "token_position": pa.array(data_batch["token_position"], type=pa.int32()),
-            })
+            batch_table = pa.Table.from_pydict(
+                {
+                    "layer_index": pa.array(data_batch["layer_index"], type=pa.int32()),
+                    "sample_id": pa.array(data_batch["sample_id"], type=pa.int32()),
+                    "latent_index": pa.array(
+                        data_batch["latent_index"], type=pa.int32()
+                    ),
+                    "activation": pa.array(data_batch["activation"], type=pa.float32()),
+                    "reconstruction_error": pa.array(
+                        data_batch["reconstruction_error"], type=pa.float32()
+                    ),
+                    "trigger_token": pa.array(
+                        data_batch["trigger_token"], type=pa.string()
+                    ),
+                    "context": pa.array(
+                        data_batch["context"], type=pa.list_(pa.string())
+                    ),
+                    "token_position": pa.array(
+                        data_batch["token_position"], type=pa.int32()
+                    ),
+                }
+            )
 
-            # Write batch_table to Parquet file
-            writer.write_table(batch_table)
-
-            # Clear data_batch to free up memory
-            del data_batch
-            del batch_table
+            # Write batch_table to Parquet dataset partitioned by 'latent_index'
+            pq.write_to_dataset(
+                table=batch_table,
+                root_path=output_data_dir,
+                partition_cols=["layer_index", "latent_index"],
+            )
 
             # Clear variables to free up memory
             del input_ids
@@ -404,10 +436,61 @@ def main():
         # Close the progress bar
         progress_bar.close()
 
-        # Close the ParquetWriter
-        writer.close()
-
         logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}")
+
+        # After processing all batches, compute per-neuron statistics
+        per_neuron_list = []
+        for latent_index, stats in per_neuron_stats.items():
+            count = stats["count"]
+            sum_activation = stats["sum_activation"]
+            sum_activation_sq = stats["sum_activation_sq"]
+            mean_activation = sum_activation / count
+            variance = (sum_activation_sq / count) - (mean_activation**2)
+            std_activation = variance**0.5 if variance > 0 else 0.0
+
+            per_neuron_list.append(
+                {
+                    "layer_index": layer_idx,
+                    "latent_index": latent_index,
+                    "count": count,
+                    "mean_activation": mean_activation,
+                    "std_activation": std_activation,
+                }
+            )
+
+        # Create PyArrow table from per_neuron_list
+        per_neuron_table = pa.Table.from_pydict(
+            {
+                "layer_index": pa.array(
+                    [item["layer_index"] for item in per_neuron_list],
+                    type=pa.int32(),
+                ),
+                "latent_index": pa.array(
+                    [item["latent_index"] for item in per_neuron_list],
+                    type=pa.int32(),
+                ),
+                "count": pa.array(
+                    [item["count"] for item in per_neuron_list],
+                    type=pa.int64(),
+                ),
+                "mean_activation": pa.array(
+                    [item["mean_activation"] for item in per_neuron_list],
+                    type=pa.float32(),
+                ),
+                "std_activation": pa.array(
+                    [item["std_activation"] for item in per_neuron_list],
+                    type=pa.float32(),
+                ),
+            }
+        )
+
+        # Write per-neuron summary to Parquet file
+        summary_file = os.path.join(
+            output_summary_dir, f"{layer_to_analyze}_summary.parquet"
+        )
+        pq.write_table(per_neuron_table, summary_file, compression="snappy")
+
+        logger.info(f"Rank {rank}: Summary statistics saved to {summary_file}")
 
     # Process each SAE assigned to this rank
     for layer_to_analyze in sae_layer_names_per_rank:
@@ -464,40 +547,46 @@ def main():
 
     # Aggregate across ranks and save as needed here
     if args.combine_output and rank == 0:
-        logger.info("Rank 0: Starting aggregation of results.")
+        logger.info("Rank 0: Starting aggregation of summaries.")
 
-        # Collect Parquet files from all ranks
-        all_files = []
+        # Collect summary Parquet files from all ranks
+        summary_files = []
         for r in range(world_size):
-            rank_output_dir = os.path.join(args.output_directory, f"rank_{r}")
-            if os.path.exists(rank_output_dir):
-                for fname in os.listdir(rank_output_dir):
-                    if fname.endswith(".parquet"):
-                        all_files.append(os.path.join(rank_output_dir, fname))
+            summary_dir = os.path.join(args.output_directory, f"rank_{r}", "summary")
+            if os.path.exists(summary_dir):
+                for fname in os.listdir(summary_dir):
+                    if fname.endswith("_summary.parquet"):
+                        summary_files.append(os.path.join(summary_dir, fname))
 
-        # Read all Parquet files and combine them
-        combined_tables = []
-        logger.info("Rank 0: Reading Parquet files from all ranks.")
-        for file in tqdm(all_files, desc="Aggregating Parquet files", ncols=80):
+        # Read all summary Parquet files and combine them
+        summary_tables = []
+        logger.info("Rank 0: Reading summary Parquet files from all ranks.")
+        for file in tqdm(summary_files, desc="Aggregating summary files", ncols=80):
             table = pq.read_table(file)
-            combined_tables.append(table)
+            summary_tables.append(table)
 
-        if combined_tables:
+        if summary_tables:
             # Concatenate all tables
-            logger.info("Rank 0: Concatenating tables.")
-            final_table = pa.concat_tables(combined_tables, promote=True)
+            logger.info("Rank 0: Concatenating summary tables.")
+            final_summary_table = pa.concat_tables(summary_tables, promote=True)
 
-            # Save the combined table
-            logger.info("Rank 0: Writing combined Parquet file...")
+            # Save the combined summary table
+            logger.info("Rank 0: Writing combined summary Parquet file...")
             final_output_dir = os.path.join(args.output_directory, "combined")
             os.makedirs(final_output_dir, exist_ok=True)
-            final_output_file = os.path.join(final_output_dir, "all_layers.parquet")
+            final_summary_file = os.path.join(
+                final_output_dir, "all_layers_summary.parquet"
+            )
 
-            pq.write_table(final_table, final_output_file, compression="snappy")
+            pq.write_table(
+                final_summary_table, final_summary_file, compression="snappy"
+            )
 
-            logger.info(f"Rank {rank}: Aggregated results saved to {final_output_file}")
+            logger.info(
+                f"Rank {rank}: Aggregated summary saved to {final_summary_file}"
+            )
         else:
-            logger.info("Rank 0: No data to aggregate.")
+            logger.info("Rank 0: No summary data to aggregate.")
 
     # Clean up
     dist.destroy_process_group()
