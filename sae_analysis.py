@@ -11,7 +11,8 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import logging
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tqdm import tqdm  # Import tqdm
+from tqdm import tqdm
+import numpy as np
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +91,7 @@ def main():
     # Function to load an SAE
     def load_sae(layer_name):
         layer_path = os.path.join(sae_directory, layer_name)
-        sae_model = Sae.load_from_disk(layer_path, device=device)
+        sae_model = Sae.load_from_disk(layer_path)
         return sae_model, sae_model.cfg
 
     # Tokenizer function using args.max_token_length
@@ -127,7 +128,11 @@ def main():
         f"Global Rank {rank}/{world_size}, Local Rank {local_rank}, using device: {device}"
     )
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
+    # Load the model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        output_hidden_states=True,
+    )
     model.to(device)
     model.eval()  # Set to evaluation mode
 
@@ -199,7 +204,7 @@ def main():
         shuffle=False,
         drop_last=True,
         pin_memory=True,
-        num_workers=0,  # Set num_workers to 0 to reduce memory usage
+        num_workers=4,  # Increased num_workers for faster data loading
     )
 
     # Log DataLoader length
@@ -248,8 +253,28 @@ def main():
             ]
         )
 
-        # Initialize per-neuron statistics
-        per_neuron_stats = {}  # key: latent_index, value: dict with stats
+        # Initialize per-neuron statistics using tensors
+        per_neuron_counts = torch.zeros(num_latents, dtype=torch.int64, device=device)
+        per_neuron_sum_activation = torch.zeros(
+            num_latents, dtype=torch.float32, device=device
+        )
+        per_neuron_sum_activation_sq = torch.zeros(
+            num_latents, dtype=torch.float32, device=device
+        )
+
+        # Initialize data buffer for batch writing
+        data_buffer = {
+            "layer_index": [],
+            "sample_id": [],
+            "latent_index": [],
+            "latent_bin": [],
+            "activation": [],
+            "reconstruction_error": [],
+            "trigger_token": [],
+            "context": [],
+            "token_position": [],
+        }
+        batch_write_size = 100000  # Adjust as needed
 
         # Start processing
         logger.info(
@@ -268,8 +293,8 @@ def main():
         )
 
         for batch_idx, batch in enumerate(progress_bar):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
             # Forward pass through the model
             with torch.no_grad():
@@ -278,161 +303,121 @@ def main():
                     attention_mask=attention_mask,
                     output_hidden_states=True,
                 )
-                hidden_states = (
-                    outputs.hidden_states
-                )  # Tuple of hidden states at each layer
+                hidden_states = outputs.hidden_states
 
             # Get the residuals (activations) at the specified layer
             residuals = hidden_states[
                 layer_idx
             ]  # Shape: [batch_size, seq_length, hidden_size]
-
-            # Flatten batch and sequence dimensions
             batch_size, seq_length, hidden_size = residuals.size()
             residuals_flat = residuals.view(
                 -1, hidden_size
-            )  # Shape: [batch_size * seq_length, hidden_size]
+            )  # Shape: [total_tokens, hidden_size]
 
             # Pass through SAE to get outputs
-            forward_output = sae_model(residuals_flat)
+            with torch.no_grad():
+                forward_output = sae_model(residuals_flat.to(sae_model.device))
 
-            # Collect activation counts
+            # Collect activation counts and per-neuron statistics
             latent_indices = forward_output.latent_indices  # Shape: [total_tokens, k]
             latent_acts = forward_output.latent_acts  # Shape: [total_tokens, k]
+            latent_indices_flat = latent_indices.view(-1)
+            latent_acts_flat = latent_acts.view(-1)
 
-            # Flatten indices and count activations
-            indices_flat = latent_indices.view(-1)
-            activation_counts += torch.bincount(indices_flat, minlength=num_latents).to(
-                torch.int64
-            )
-
-            # Total tokens processed
+            # Update activation counts
+            activation_counts += torch.bincount(
+                latent_indices_flat, minlength=num_latents
+            ).to(torch.int64)
             total_tokens += residuals_flat.size(0)
+
+            # Update per-neuron statistics
+            counts = torch.bincount(latent_indices_flat, minlength=num_latents)
+            per_neuron_counts += counts
+            per_neuron_sum_activation.scatter_add_(
+                0, latent_indices_flat, latent_acts_flat
+            )
+            per_neuron_sum_activation_sq.scatter_add_(
+                0, latent_indices_flat, latent_acts_flat**2
+            )
 
             # Reconstruction error per token
             reconstruction_errors = torch.mean(
-                (residuals_flat - forward_output.sae_out) ** 2, dim=1
+                (residuals_flat - forward_output.sae_out.to(device)) ** 2, dim=1
             )  # Shape: [total_tokens]
 
-            # Prepare context and token data
-            # Initialize lists to store data for this batch
-            data_batch = {
-                "layer_index": [],
-                "sample_id": [],
-                "latent_index": [],
-                "latent_bin": [],  # New column
-                "activation": [],
-                "reconstruction_error": [],
-                "trigger_token": [],
-                "context": [],
-                "token_position": [],
-            }
+            # Prepare data for saving
+            k = latent_indices.size(1)
+            total_activations = latent_indices_flat.size(0)
 
-            for i in range(batch_size):
-                input_id_sequence = input_ids[i]
-                tokens = tokenizer.convert_ids_to_tokens(input_id_sequence)
-                text_length = len(tokens)
+            # Generate sample_ids and token_positions
+            sample_ids = batch_idx * batch_size + torch.arange(
+                batch_size, device=device
+            ).unsqueeze(1).repeat(1, seq_length).view(
+                -1
+            )  # [total_tokens]
+            sample_ids_expanded = sample_ids.repeat_interleave(k).cpu().numpy()
 
+            token_positions = (
+                torch.arange(seq_length, device=device)
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+                .view(-1)
+            )  # [total_tokens]
+            token_positions_expanded = (
+                token_positions.repeat_interleave(k).cpu().numpy()
+            )
+
+            reconstruction_errors_expanded = (
+                reconstruction_errors.repeat_interleave(k).cpu().numpy()
+            )
+
+            latent_bins = (latent_indices_flat % 1024).cpu().numpy()
+
+            # Convert input_ids to tokens
+            input_ids_cpu = input_ids.cpu().numpy()
+            tokens_batch = [
+                tokenizer.convert_ids_to_tokens(ids) for ids in input_ids_cpu
+            ]
+            tokens_flat = [token for tokens_seq in tokens_batch for token in tokens_seq]
+            tokens_flat = np.array(tokens_flat)
+            trigger_tokens_expanded = np.repeat(tokens_flat, k)
+
+            # Prepare context
+            context_tokens_expanded = []
+            for tokens_seq in tokens_batch:
+                text_length = len(tokens_seq)
                 for j in range(seq_length):
-                    idx_in_batch = i * seq_length + j
-
-                    # Get the reconstruction error, token, context, position
-                    reconstruction_error = reconstruction_errors[idx_in_batch].item()
-                    trigger_token = tokens[j]
-                    token_position = j
-
-                    # Get context window
                     start = max(0, j - args.context_window)
                     end = min(text_length, j + args.context_window + 1)
-                    context_tokens = tokens[start:end]
+                    context_tokens = tokens_seq[start:end]
+                    context_tokens_expanded.extend([context_tokens] * k)
 
-                    # Get the activations and latent indices for this token
-                    activations = latent_acts[idx_in_batch].detach().cpu().numpy()
-                    latent_indices_token = (
-                        latent_indices[idx_in_batch].detach().cpu().numpy()
-                    )
-
-                    # For each latent activated for this token
-                    for k in range(len(activations)):
-                        activation_value = activations[k]
-                        latent_index = int(latent_indices_token[k])
-                        latent_bin = latent_index % 1024  # Bucket by max partitions
-
-                        # Update per-neuron stats
-                        if latent_index not in per_neuron_stats:
-                            per_neuron_stats[latent_index] = {
-                                "count": 0,
-                                "sum_activation": 0.0,
-                                "sum_activation_sq": 0.0,
-                            }
-
-                        per_neuron_stats[latent_index]["count"] += 1
-                        per_neuron_stats[latent_index][
-                            "sum_activation"
-                        ] += activation_value
-                        per_neuron_stats[latent_index]["sum_activation_sq"] += (
-                            activation_value**2
-                        )
-
-                        # Append to batch data
-                        data_batch["layer_index"].append(layer_idx)
-                        data_batch["sample_id"].append(batch_idx * batch_size + i)
-                        data_batch["latent_index"].append(latent_index)
-                        data_batch["latent_bin"].append(latent_bin)  # New column
-                        data_batch["activation"].append(activation_value)
-                        data_batch["reconstruction_error"].append(reconstruction_error)
-                        data_batch["trigger_token"].append(trigger_token)
-                        data_batch["context"].append(context_tokens)
-                        data_batch["token_position"].append(token_position)
-
-            # Convert data_batch to PyArrow Table
-            batch_table = pa.Table.from_pydict(
-                {
-                    "layer_index": pa.array(data_batch["layer_index"], type=pa.int32()),
-                    "sample_id": pa.array(data_batch["sample_id"], type=pa.int32()),
-                    "latent_index": pa.array(
-                        data_batch["latent_index"], type=pa.int32()
-                    ),
-                    "latent_bin": pa.array(  # New column
-                        data_batch["latent_bin"], type=pa.int32()
-                    ),
-                    "activation": pa.array(data_batch["activation"], type=pa.float32()),
-                    "reconstruction_error": pa.array(
-                        data_batch["reconstruction_error"], type=pa.float32()
-                    ),
-                    "trigger_token": pa.array(
-                        data_batch["trigger_token"], type=pa.string()
-                    ),
-                    "context": pa.array(
-                        data_batch["context"], type=pa.list_(pa.string())
-                    ),
-                    "token_position": pa.array(
-                        data_batch["token_position"], type=pa.int32()
-                    ),
-                }
+            # Append to data buffer
+            data_buffer["layer_index"].extend([layer_idx] * total_activations)
+            data_buffer["sample_id"].extend(sample_ids_expanded.tolist())
+            data_buffer["latent_index"].extend(latent_indices_flat.cpu().tolist())
+            data_buffer["latent_bin"].extend(latent_bins.tolist())
+            data_buffer["activation"].extend(latent_acts_flat.cpu().tolist())
+            data_buffer["reconstruction_error"].extend(
+                reconstruction_errors_expanded.tolist()
             )
+            data_buffer["trigger_token"].extend(trigger_tokens_expanded.tolist())
+            data_buffer["context"].extend(context_tokens_expanded)
+            data_buffer["token_position"].extend(token_positions_expanded.tolist())
 
-            # Write batch_table to Parquet dataset partitioned by 'latent_bin'
-            pq.write_to_dataset(
-                table=batch_table,
-                root_path=output_data_dir,
-                partition_cols=["latent_bin"],
-                use_legacy_dataset=False,
-                max_partitions=1024,  # Set max_partitions to 1024
-            )
-
-            # Clear variables to free up memory
-            del input_ids
-            del attention_mask
-            del outputs
-            del hidden_states
-            del residuals
-            del residuals_flat
-            del forward_output
-            del latent_indices
-            del latent_acts
-            del reconstruction_errors
-            torch.cuda.empty_cache()
+            # Write to Parquet if buffer is large enough
+            if len(data_buffer["layer_index"]) >= batch_write_size:
+                batch_table = pa.Table.from_pydict(data_buffer, schema=schema)
+                pq.write_to_dataset(
+                    table=batch_table,
+                    root_path=output_data_dir,
+                    partition_cols=["latent_bin"],
+                    use_legacy_dataset=False,
+                    max_partitions=1024,
+                )
+                # Clear the data buffer
+                for key in data_buffer:
+                    data_buffer[key].clear()
 
             # Update progress bar
             progress_bar.set_postfix(batch=batch_idx)
@@ -440,51 +425,38 @@ def main():
         # Close the progress bar
         progress_bar.close()
 
+        # Write any remaining data in the buffer
+        if len(data_buffer["layer_index"]) > 0:
+            batch_table = pa.Table.from_pydict(data_buffer, schema=schema)
+            pq.write_to_dataset(
+                table=batch_table,
+                root_path=output_data_dir,
+                partition_cols=["latent_bin"],
+                use_legacy_dataset=False,
+                max_partitions=1024,
+            )
+
         logger.info(f"Rank {rank}: Finished processing {layer_to_analyze}")
 
         # After processing all batches, compute per-neuron statistics
-        per_neuron_list = []
-        for latent_index, stats in per_neuron_stats.items():
-            count = stats["count"]
-            sum_activation = stats["sum_activation"]
-            sum_activation_sq = stats["sum_activation_sq"]
-            mean_activation = sum_activation / count
-            variance = (sum_activation_sq / count) - (mean_activation**2)
-            std_activation = variance**0.5 if variance > 0 else 0.0
+        per_neuron_counts_cpu = per_neuron_counts.cpu()
+        per_neuron_sum_activation_cpu = per_neuron_sum_activation.cpu()
+        per_neuron_sum_activation_sq_cpu = per_neuron_sum_activation_sq.cpu()
 
-            per_neuron_list.append(
-                {
-                    "layer_index": layer_idx,
-                    "latent_index": latent_index,
-                    "count": count,
-                    "mean_activation": mean_activation,
-                    "std_activation": std_activation,
-                }
-            )
+        # Avoid division by zero
+        counts = per_neuron_counts_cpu.clamp_min(1)
+        mean_activation = per_neuron_sum_activation_cpu / counts
+        variance = (per_neuron_sum_activation_sq_cpu / counts) - (mean_activation**2)
+        std_activation = torch.sqrt(variance.clamp_min(0))
 
-        # Create PyArrow table from per_neuron_list
+        # Create PyArrow table from per-neuron statistics
         per_neuron_table = pa.Table.from_pydict(
             {
-                "layer_index": pa.array(
-                    [item["layer_index"] for item in per_neuron_list],
-                    type=pa.int32(),
-                ),
-                "latent_index": pa.array(
-                    [item["latent_index"] for item in per_neuron_list],
-                    type=pa.int32(),
-                ),
-                "count": pa.array(
-                    [item["count"] for item in per_neuron_list],
-                    type=pa.int64(),
-                ),
-                "mean_activation": pa.array(
-                    [item["mean_activation"] for item in per_neuron_list],
-                    type=pa.float32(),
-                ),
-                "std_activation": pa.array(
-                    [item["std_activation"] for item in per_neuron_list],
-                    type=pa.float32(),
-                ),
+                "layer_index": pa.array([layer_idx] * num_latents, type=pa.int32()),
+                "latent_index": pa.array(range(num_latents), type=pa.int32()),
+                "count": pa.array(per_neuron_counts_cpu.numpy(), type=pa.int64()),
+                "mean_activation": pa.array(mean_activation.numpy(), type=pa.float32()),
+                "std_activation": pa.array(std_activation.numpy(), type=pa.float32()),
             }
         )
 
@@ -548,7 +520,7 @@ def main():
 
     # Synchronize
     dist.barrier()
-    
+
     # Clean up
     dist.destroy_process_group()
 
